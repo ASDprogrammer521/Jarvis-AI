@@ -30,6 +30,8 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
+from core.space_map import MapView, zoom_for_bbox
+
 CARD_W, CARD_H = 220, 150
 GAP = 26
 TOP_MARGIN, BOTTOM_MARGIN, SIDE_MARGIN = 150, 130, 90      # the card grid lives between the top bar and the bottom bar
@@ -39,6 +41,20 @@ GAIN = 1.25                      # camera → screen: the central 80 % of the pi
 MAX_THROW = 4200.0
 TAP_SECONDS, TAP_PIXELS = 0.38, 42
 FIST_SECONDS = 1.0
+# gestures with an open hand
+SWIPE_DIST = 0.17                # a swipe covers this fraction of the screen width …
+SWIPE_WINDOW = 0.32              # … within this many seconds …
+SWIPE_SPEED = 1300.0             # … at (at least) this speed, px/s, and mostly sideways
+SWIPE_LOCK, SWIPE_BACK_LOCK = 0.7, 1.1    # pause before another swipe the same way / the way the hand comes back
+PALM_HOLD, PALM_STILL = 0.8, 260.0        # a flat palm held this long (s) while moving slower than this (px/s) = pause / resume
+TWIST_MAX_SPEED = 450.0          # px/s: a hand that sweeps across the screen is not turning a knob
+VOL_DEAD, VOL_PER_RAD = 0.14, 100.0 / 2.1 # 8° of twist before the volume moves; then a 120° turn covers the whole range
+VOL_SIGN = 1.0                   # clockwise (as you see your own hand) = louder. Set to -1.0 to reverse.
+CAM_ASPECT = 4.0 / 3.0           # camera picture width ÷ height: the twist angle is measured in the camera's own, undistorted picture
+# spoken commands (Jarvis → hand_control tool → Space.voice). An allow-list: nothing here deletes, moves, renames or launches a file.
+VOICE_VERBS = frozenset({"map_goto", "zoom_in", "zoom_out", "refresh", "mail_read", "inbox", "scan_receipt", "next", "previous", "back", "close", "home", "up", "page_next", "page_prev", "play", "pause",
+                         "toggle_play", "volume", "volume_up", "volume_down", "mute", "unmute", "fullscreen", "exit_fullscreen",
+                         "seek_forward", "seek_back", "open"})
 MAX_ENTRIES = 3000
 TEXT_BYTES, TEXT_CHARS = 48000, 24000
 
@@ -49,10 +65,10 @@ PLAIN_EXT = {".md", ".markdown", ".txt", ".log", ".tex", ".srt"}      # shown in
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".ico"}
 MODEL_EXT = {".obj", ".stl", ".fbx", ".glb", ".gltf", ".usd", ".usda", ".usdc", ".usdz", ".step", ".stp"}   # 3D models: drawn on the GPU, turned with the hand
 VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg"}   # played by mpv on the GPU
-FULL_KINDS = ("image", "video", "model")                          # these can fill the whole screen
+FULL_KINDS = ("image", "video", "model", "map")                          # these can fill the whole screen
 SEEK_STEP = 10.0                                               # seconds skipped by the video's − / + buttons
 # never launched from a gesture: a stray pinch must not start a program
-NO_LAUNCH = {".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+NO_LAUNCH = {".feed", ".map", ".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
              ".lnk", ".reg", ".dll", ".jar", ".hta", ".cpl", ".pif", ".msc", ".sh", ".py", ".pyw", ".appx", ".msix"}
 SORTS = ("name", "date", "size", "type")
 SORT_LABEL = {"name": "Name", "date": "Date", "size": "Size", "type": "Type"}
@@ -130,6 +146,21 @@ def _drive_entry(root: str, title: str) -> dict:
         pass
     return {"kind": "drive", "title": title, "sub": sub, "used": used, "path": root, "image": None, "text": "",
             "_dir": True, "_mt": 0.0, "_sz": 0, "_ext": ""}
+
+
+def virtual_entries() -> list[dict]:
+    """The Map, Calendar, Mail and Expenses cards that sit beside the drives. They are not files (path ""): `_virtual` keeps
+    every file action away from them, and `.feed` / `.map` are never launched. Their content is fetched only when opened."""
+    base = {"image": None, "_dir": False, "_mt": 0.0, "_sz": 0, "_virtual": True, "path": "", "pinned": False}
+    return [
+        {**base, "kind": "map", "title": "World map", "sub": "Pan and zoom · cities and places", "text": "", "_ext": ".map"},
+        {**base, "kind": "text", "title": "Calendar", "sub": "Meetings", "text": "Your next meetings", "full": "Loading…",
+         "_feed": "calendar", "_filled": True, "_ext": ".feed", "mono": False},
+        {**base, "kind": "text", "title": "Mail", "sub": "Inbox (read only)", "text": "Your latest emails", "full": "Loading…",
+         "_feed": "mail", "_filled": True, "_ext": ".feed", "mono": False},
+        {**base, "kind": "text", "title": "Expenses", "sub": "This month", "text": "Spending by category — drop a receipt here",
+         "full": "Loading…", "_feed": "expenses", "_filled": True, "_ext": ".feed", "mono": False},
+    ]
 
 
 def list_roots(pinned: str | None = None) -> list[dict]:
@@ -524,6 +555,14 @@ class Hand:
         self.dpos = (0.0, 0.0)            # what is DRAWN: pos / palm eased every screen frame (hand data arrives at the camera's 10-30 Hz)
         self.dpalm = (0.0, 0.0)
         self._rt, self._rin = 0.0, 0.04
+        self.flat = False                 # all four fingers straight: a deliberate flat palm
+        self.roll = 0.0                   # angle of wrist → middle knuckle in the CAMERA picture, clockwise = positive (radians)
+        self._roll_prev: float | None = None
+        self.roll_acc = 0.0               # twist since the volume gesture started (dead band)
+        self.twisting = False
+        self.palm_since = 0.0             # a flat, still palm: when it began; palm_prog fills 0 → 1, at 1 the film pauses / resumes
+        self.palm_prog = 0.0
+        self.palm_fired = False
 
     def update(self, pts, ratio: float, tips: list[float], now: float):
         self.pts = pts
@@ -540,6 +579,7 @@ class Hand:
         bent = sum(1 for r in tips if 1.15 < r <= 1.7)
         self.fist = all(r <= 1.15 for r in tips)
         self.open = ext >= 3
+        self.flat = ext == 4
         self.claw = bent >= 3 and not self.fist
         # pinch with hysteresis + confirmation; a fist never pinches (thumb and index touch in a fist)
         if self.fist:
@@ -624,6 +664,17 @@ class Space:
         self.on_release = None                   # callable(paths): the UI lets go of files it holds open (a playing video)
         self._job: Future | None = None
         self._pool: ThreadPoolExecutor | None = None
+        self.volume = 100.0                       # the film player's volume (mpv starts at 100), kept across films
+        self.virtual = True                       # the Map / Calendar / Mail / Expenses cards on the "This PC" page
+        self.mapview = MapView()                  # one map, remembered while Hand Space is open
+        self.requests: list = []                  # jobs for the window's worker threads: ("feed", kind) · ("geocode", text) · ("mail_read", id) · ("receipt", path)
+        self.feed_text: dict[str, str] = {}
+        self._feed_t: dict[str, float] = {}
+        self._mail_ids: list[str] = []
+        self._vol_before_mute = 100.0
+        self._swipe_until = {1: 0.0, -1: 0.0}
+        self._swipe_t = 0.0
+        self.g_swipe = self.g_palm = self.g_twist = True      # each open-hand gesture can be switched off
 
     # ── small helpers ────────────────────────────────────────────────────────────
     def say(self, text: str, secs: float = 2.4):
@@ -670,6 +721,8 @@ class Space:
             return max(w, CARD_W), max(h, CARD_H)
         if kind == "text":
             return (min(W * 0.8, 1400.0) if full else min(W * 0.62, 1000.0)), ah
+        if kind == "map":
+            return (float(W), float(H)) if full else (min(W * 0.82, 1560.0), ah)
         if kind == "model":
             if full:
                 return float(W), float(H)
@@ -690,7 +743,10 @@ class Space:
 
     def go_root(self):
         self.path = None
-        self.entries = list_roots(self.pinned)
+        self.entries = list_roots(self.pinned) + (virtual_entries() if self.virtual else [])
+        for e in self.entries:
+            if e.get("_feed") and self.feed_text.get(e["_feed"]):
+                e["full"] = self.feed_text[e["_feed"]]
         self.page = 0
         self.select, self.sel, self.confirm = False, set(), None
         self._build_page()
@@ -833,6 +889,10 @@ class Space:
             c.yaw, c.pitch, c.paused, c.cmds = 0.6, 0.3, False, []
             c.yaw_t, c.pitch_t = 0.6, 0.3
             c.homing = False
+            if c.data.get("kind") == "video":
+                c.cmds.append(("volume", int(round(self.volume))))
+            if c.data.get("_feed"):
+                self._want_feed(c.data["_feed"])
         else:
             c.open = False
             c.home, c.homing = c.ret, True
@@ -973,7 +1033,7 @@ class Space:
             if away:
                 add("a_more", W - 40 - bw, yb, active=self.menu)
         else:
-            tool = kind in ("image", "text", "model")
+            tool = kind in ("image", "text", "model", "map")
             specs = [("v_close", True), ("v_prev", same > 1), ("v_minus", tool or kind == "video")]
             if kind == "video":
                 specs.append(("v_play", True))
@@ -1083,6 +1143,8 @@ class Space:
                 op.zoom = max(0.4, min(6.0, op.zoom * (1.25 if sign > 0 else 1 / 1.25)))
             elif op.data["kind"] == "video":
                 op.cmds.append(("seek", SEEK_STEP * sign))
+            elif op.data["kind"] == "map":
+                self.mapview.zoom_by(float(sign))
             elif op.data["kind"] == "text":
                 op.scroll = max(0.0, op.scroll + (-sign) * 180.0)        # + = up, − = down, like a scroll bar's arrows
 
@@ -1120,7 +1182,7 @@ class Space:
         """What the file buttons act on: the open card, else the marked cards, else the one under the pointer."""
         op = self._opened()
         if op is not None:
-            return [op.data["path"]]
+            return [] if op.data.get("_virtual") else [op.data["path"]]
         if self.select:
             return [e["path"] for e in self.entries if e["path"] in self.sel]
         hc = self.hover_card
@@ -1359,6 +1421,7 @@ class Space:
             tips = [_d(lm[0], lm[t]) / max(1e-6, _d(lm[0], lm[m])) for t, m in ((8, 5), (12, 9), (16, 13), (20, 17))]
             was_pinch = hand.pinching
             hand.update([self.to_screen(p) for p in lm], ratio, tips, now)
+            hand.roll = math.atan2(lm[9][1] - lm[0][1], (lm[9][0] - lm[0][0]) * CAM_ASPECT)
             self.visible[i] = True
             hand._edge = (not was_pinch and hand.pinching, was_pinch and not hand.pinching)
         self._interact(now)
@@ -1400,6 +1463,8 @@ class Space:
             op.zoom = max(0.4, min(6.0, op.zoom * (1.12 if dy > 0 else 1 / 1.12)))
         elif op.data["kind"] == "video":
             op.cmds.append(("seek", 5.0 if dy > 0 else -5.0))
+        elif op.data["kind"] == "map":
+            self.mapview.zoom_by(0.5 if dy > 0 else -0.5, x - op.x, y - op.y)
 
     def key_arrow(self, step: int):
         if self._opened() is not None:
@@ -1415,6 +1480,7 @@ class Space:
         hand.pts = None
         hand.claw = hand.fist = hand.open = False
         hand.fist_since, hand.fist_prog, hand.fist_fired = 0.0, 0.0, False
+        self._gesture_reset(hand)
         hand.hist.clear()
         hand.palm = (0.0, 0.0)
 
@@ -1462,6 +1528,11 @@ class Space:
         h.held = False
         h._htx = h._hty = None
         moved = _d(hand.palm, hand.down_pos)
+        if (h.data.get("kind") == "image" and not h.open and h.data.get("path")
+                and not (now - hand.down_t < TAP_SECONDS and moved < TAP_PIXELS)):
+            tgt = next((o for o in self.cards if o is not h and o.data.get("_feed") == "expenses" and not o.open and o.hit(h.x, h.y, 0)), None)
+            if tgt is not None:
+                self._scan_receipt(h.data["path"])
         if now - hand.down_t < TAP_SECONDS and moved < TAP_PIXELS:           # a tap: go in / open / close
             if h.open:
                 if self.full:                                  # full screen: a tap never leaves; it wakes the controls / pauses a film
@@ -1485,16 +1556,20 @@ class Space:
         act = [(i, h) for i, h in enumerate(self.hands) if self.visible[i]]
         op = self._opened()
         # two hands pinching while a picture is open: zoom it
-        both = (op is not None and op.data["kind"] in ("image", "model") and len(act) == 2 and all(h.pinching for _, h in act))
+        both = (op is not None and op.data["kind"] in ("image", "model", "map") and len(act) == 2 and all(h.pinching for _, h in act))
         if both:
             a, b = act[0][1].pos, act[1][1].pos
             dist = max(40.0, _d(a, b))
             if self._two is None:
-                self._two = {"dist": dist, "zoom": op.zoom}
+                self._two = {"dist": dist, "zoom": op.zoom, "z": self.mapview.tz}
                 for _, h in act:
                     h.held = "zoom"
                     if isinstance(h.held, Card):
                         h.held.held = False
+            if op.data["kind"] == "map":
+                self.mapview.set_zoom(self._two["z"] + math.log2(dist / self._two["dist"]),
+                                      (a[0] + b[0]) / 2 - op.x, (a[1] + b[1]) / 2 - op.y)
+                return
             op.zoom = max(0.4 if op.data["kind"] == "model" else 1.0, min(8.0, self._two["zoom"] * dist / self._two["dist"]))
             if op.data["kind"] == "image":
                 self._clamp_view(op)
@@ -1535,6 +1610,9 @@ class Space:
                         _learn(c, now)
                         c.yaw_t += dx * 0.008                           # a target: step() eases the model to it every screen frame,
                         c.pitch_t = max(-1.5, min(1.5, c.pitch_t + dy * 0.008))   # so 10-30 Hz hand input still turns it smoothly
+                    elif c.data["kind"] == "map":                       # drag = move the map
+                        _learn(c, now)
+                        self.mapview.pan_px(dx, dy)
                     elif c.data["kind"] == "video" and dx:              # drag sideways = scrub
                         c.cmds.append(("seek", dx / max(200.0, c.w) * 90.0))
                 h.last = h.pos
@@ -1543,6 +1621,9 @@ class Space:
                 h.fist_fired = True
                 self.back()
                 return
+
+        if not mouse:
+            self._gestures(act, now)
 
         # claw: pull every free card into an orbit around the palm
         claw = next((h for _, h in act if h.claw and not h.pinching), None)
@@ -1558,7 +1639,7 @@ class Space:
             for c in self.cards:
                 c._target = None
         # open-palm swipe pushes nearby cards
-        if self._opened() is None:
+        if self._opened() is None and now - self._swipe_t > 0.9:
             for _, h in act:
                 if h.open and h.speed > 900 and not mouse:
                     for c in self.cards:
@@ -1567,6 +1648,292 @@ class Space:
                             c.vx += (c.x - h.palm[0]) / d * min(h.speed, 2200) * 0.5
                             c.vy += (c.y - h.palm[1]) / d * min(h.speed, 2200) * 0.5
                             c.homing = False
+
+    # ── open-hand gestures: swipe · flat palm = pause · twist = volume ────────────────
+    def _gesture_reset(self, h: Hand):
+        h.palm_since = h.palm_prog = 0.0
+        h.palm_fired = h.twisting = False
+        h.roll_acc = 0.0
+        h._roll_prev = None
+
+    def _gestures(self, act, now: float):
+        op = self._opened()
+        video = op is not None and op.data.get("kind") == "video"
+        for _, h in act:
+            if not (h.pts and h.open and not h.pinching and not h.fist and h.held is None):
+                self._gesture_reset(h)
+                continue
+            if self.g_swipe:
+                self._swipe(h, now)
+            if not (video and h.flat):
+                h.palm_since = h.palm_prog = 0.0
+                h.twisting, h.roll_acc, h._roll_prev = False, 0.0, None
+                continue
+            if self.g_twist and h.speed < TWIST_MAX_SPEED:
+                self._twist(h)
+            else:
+                h.twisting, h.roll_acc, h._roll_prev = False, 0.0, None
+            if not self.g_palm:
+                continue
+            if h.twisting:                                      # turning the knob is not a pause request
+                h.palm_since = h.palm_prog = 0.0
+                h.palm_fired = True
+            elif h.speed < PALM_STILL:
+                h.palm_since = h.palm_since or now
+                h.palm_prog = min(1.0, (now - h.palm_since) / PALM_HOLD)
+                if h.palm_prog >= 1.0 and not h.palm_fired:
+                    h.palm_fired = True                         # once per raised palm; lower / close the hand to arm it again
+                    op.paused = not op.paused
+                    op.cmds.append(("pause", op.paused))
+                    self.say("Paused" if op.paused else "Playing", 1.0)
+            else:
+                h.palm_since = h.palm_prog = 0.0
+
+    def _swipe(self, h: Hand, now: float):
+        pts = [q for q in h.hist if now - q[0] <= SWIPE_WINDOW]
+        if len(pts) < 2:
+            return
+        (t0, x0, y0), (t1, x1, y1) = pts[0], pts[-1]
+        dt, dx, dy = t1 - t0, x1 - x0, y1 - y0
+        if dt < 0.06 or abs(dx) < SWIPE_DIST * self.w or abs(dx) < 2.2 * abs(dy) or abs(dx) / dt < SWIPE_SPEED:
+            return
+        d = 1 if dx > 0 else -1
+        if now < self._swipe_until[d]:
+            return
+        self._swipe_until = {d: now + SWIPE_LOCK, -d: now + SWIPE_BACK_LOCK}      # the hand coming back is not a swipe
+        self._swipe_t = now
+        h.hist.clear()
+        step = -d                                               # the hand moves left → the next one
+        self.key_arrow(step)                                    # open card: next / previous film, picture, model · none: next page
+        self.say("Next  ›" if step > 0 else "‹  Previous", 0.9)
+
+    def _twist(self, h: Hand):
+        if h._roll_prev is None:
+            h._roll_prev = h.roll
+            return
+        dr = (h.roll - h._roll_prev + math.pi) % (2 * math.pi) - math.pi
+        h._roll_prev = h.roll
+        if abs(dr) > 0.5:                                       # a landmark glitch, not a hand
+            return
+        if not h.twisting:
+            h.roll_acc += dr
+            if abs(h.roll_acc) >= VOL_DEAD:
+                h.twisting, h.roll_acc = True, 0.0
+            return
+        self.set_volume(self.volume + VOL_SIGN * dr * VOL_PER_RAD)
+
+    def set_volume(self, v: float):
+        v = max(0.0, min(100.0, float(v)))
+        if int(round(v)) == int(round(self.volume)):
+            self.volume = v
+            return
+        self.volume = v
+        op = self._opened()
+        if op is not None and op.data.get("kind") == "video":
+            op.cmds.append(("volume", int(round(v))))
+        self.say(f"Volume  {int(round(v))}%", 1.0)
+
+    # ── spoken commands ──────────────────────────────────────────────────────────
+    def voice(self, verb: str, arg: str = "") -> str:
+        """Runs one allow-listed spoken command and returns what happened (also shown on screen). `arg` is only ever a
+        number or a name matched against what is listed here — never a path, so a spoken sentence can't reach other files."""
+        verb = (verb or "").strip().lower()
+        arg = "".join(ch for ch in str(arg or "") if ch.isprintable())[:120].strip()
+        if verb not in VOICE_VERBS:
+            return "That is not a Hand Space command."
+        now = time.time()
+        self.wake()
+        op = self._opened()
+        video = op is not None and op.data.get("kind") == "video"
+        if verb == "map_goto":
+            if not arg:
+                return "Which place?"
+            if not self._open_virtual("map"):
+                return "The map card is turned off (hs_extra_cards)."
+            self.requests.append(("geocode", arg))
+            self.say(f"Looking for {arg[:40]}…", 2.0)
+            return f"Looking for {arg[:40]}."
+        if verb in ("zoom_in", "zoom_out"):
+            if op is None or op.data.get("kind") not in ("image", "model", "map", "text"):
+                return "Nothing to zoom."
+            self._press("v_plus" if verb == "zoom_in" else "v_minus", now)
+            return "Done."
+        if verb == "refresh":
+            if op is not None and op.data.get("_feed"):
+                self._want_feed(op.data["_feed"], force=True)
+                return "Refreshing."
+            return "Nothing to refresh."
+        if verb == "inbox":
+            if self._open_virtual("mail"):
+                self._want_feed("mail", force=True)
+                return "Opening your inbox."
+            return "Mail isn't available here."
+        if verb == "mail_read":
+            try:
+                n = int(float(arg))
+            except ValueError:
+                return "Which message number?"
+            if not 1 <= n <= len(self._mail_ids):
+                return "Open the inbox first, then say the message number."
+            self._open_virtual("mail")
+            self.requests.append(("mail_read", self._mail_ids[n - 1]))
+            return f"Opening message {n}."
+        if verb == "scan_receipt":
+            if op is not None and op.data.get("kind") == "image" and op.data.get("path"):
+                self._scan_receipt(op.data["path"])
+                return "Scanning the receipt."
+            return "Open the receipt picture first."
+        if verb in ("next", "previous"):
+            self.key_arrow(1 if verb == "next" else -1)
+            return "Done."
+        if verb in ("page_next", "page_prev"):
+            self.change_page(1 if verb == "page_next" else -1)
+            return "Done."
+        if verb == "back":
+            self.back()
+            return "Done."
+        if verb == "close":
+            if op is not None:
+                self._set_open(op, False)
+            return "Done."
+        if verb == "home":
+            self.go_root()
+            return "Done."
+        if verb == "up":
+            self.go_up()
+            return "Done."
+        if verb == "open":
+            return self._open_by_name(arg)
+        if verb in ("fullscreen", "exit_fullscreen"):
+            if verb == "fullscreen" and op is not None and kind_of(op) in FULL_KINDS and not self.full:
+                self._press("v_full", now)
+            elif verb == "exit_fullscreen" and self.full:
+                self.full = False
+            else:
+                return "Nothing to change."
+            return "Done."
+        if verb in ("volume", "volume_up", "volume_down", "mute", "unmute"):
+            if verb == "volume":
+                try:
+                    v = float(arg.rstrip("%").strip())
+                except ValueError:
+                    return "Say a volume between 0 and 100."
+            elif verb == "mute":
+                if self.volume > 0:
+                    self._vol_before_mute = self.volume
+                v = 0.0
+            elif verb == "unmute":
+                v = self._vol_before_mute or 50.0
+            else:
+                v = self.volume + (10.0 if verb == "volume_up" else -10.0)
+            self.set_volume(v)
+            return f"Volume is {int(round(self.volume))}%."
+        if not video:                                           # the rest controls an open film
+            return "No film is open."
+        if verb in ("play", "pause", "toggle_play"):
+            want = (not op.paused) if verb == "toggle_play" else (verb == "pause")
+            if want != op.paused:
+                op.paused = want
+                op.cmds.append(("pause", want))
+            self.say("Paused" if op.paused else "Playing", 1.0)
+            return "Paused." if op.paused else "Playing."
+        try:                                                    # seek_forward / seek_back
+            secs = max(1.0, min(600.0, float(arg))) if arg else SEEK_STEP
+        except ValueError:
+            secs = SEEK_STEP
+        op.cmds.append(("seek", secs if verb == "seek_forward" else -secs))
+        return "Done."
+
+    # ── the Map / Calendar / Mail / Expenses cards ───────────────────────────────
+    def _want_feed(self, which: str, force: bool = False):
+        """Ask the window's worker thread for a card's content (at most every 45 s unless forced)."""
+        now = time.time()
+        if not force and now - self._feed_t.get(which, 0.0) < 45.0:
+            return
+        self._feed_t[which] = now
+        self.requests.append(("feed", which))
+
+    def _open_virtual(self, which: str) -> bool:
+        """Opens the Map ("map") or a feed card ("calendar" | "mail" | "expenses") from wherever you are."""
+        def is_it(e):
+            return e.get("kind") == "map" if which == "map" else e.get("_feed") == which
+        if self.path is not None or not any(is_it(e) for e in self.entries):
+            self.go_root()
+        i = next((i for i, e in enumerate(self.entries) if is_it(e)), None)
+        if i is None:
+            return False
+        if i // self.per_page != self.page:
+            self.page = i // self.per_page
+            self._build_page()
+        card = next((c for c in self.cards if c.data is self.entries[i]), None)
+        if card is None:
+            return False
+        if not card.open:
+            self._activate(card)
+        return True
+
+    def _scan_receipt(self, path: str):
+        if path:
+            self.say("Scanning the receipt…", 3.0)
+            self.requests.append(("receipt", str(path)))
+
+    def deliver(self, what: str, payload) -> None:
+        """Results of the background jobs (called from the window's thread): a card's content, a found place, a scanned receipt."""
+        if what == "feed" and isinstance(payload, dict):
+            f = payload.get("feed")
+            if f not in ("calendar", "mail", "expenses"):
+                return
+            text = str(payload.get("text") or "")[:12000]
+            self.feed_text[f] = text
+            if payload.get("ids") is not None:
+                self._mail_ids = [str(i) for i in payload["ids"]][:30]
+            for e in self.entries:
+                if e.get("_feed") == f:
+                    e["full"] = text
+            for c in self.cards:
+                if c.data.get("_feed") == f:
+                    c.scroll = 0.0
+            self.version += 1
+        elif what == "geocode":
+            if isinstance(payload, dict):
+                bb = payload.get("bbox")
+                z = zoom_for_bbox(*bb, self.w * 0.8, self.h * 0.7) if bb else 11.0
+                self.mapview.goto(payload["lat"], payload["lon"], z)
+                self.mapview.set_marker(payload["lat"], payload["lon"], payload.get("label", ""))
+                self.say(str(payload.get("label", ""))[:70], 3.0)
+            else:
+                self.say(str(payload)[:110], 3.5)
+        elif what == "receipt" and isinstance(payload, dict):
+            self.say(str(payload.get("msg", ""))[:160], 5.5)
+            self.deliver("feed", {"feed": "expenses", "text": payload.get("text", "")})
+        elif what == "toast":
+            self.say(str(payload)[:140], 4.0)
+
+    def _open_by_name(self, name: str) -> str:
+        key = name.casefold().strip()
+        if not key:
+            return "Which one?"
+        titles = [(i, str(e.get("title", ""))) for i, e in enumerate(self.entries)]
+        for hit in (lambda t: t.casefold() == key, lambda t: t.casefold().startswith(key), lambda t: key in t.casefold()):
+            found = [(i, t) for i, t in titles if hit(t)]
+            if found:
+                break
+        if not found:
+            self.say(f"Can't find “{name[:40]}” here")
+            return f"I can't find {name[:40]} in this folder."
+        if len(found) > 1:
+            names = ", ".join(t for _, t in found[:4])
+            self.say("Several match — be more specific")
+            return f"Several match: {names}."
+        i = found[0][0]
+        if i // self.per_page != self.page:
+            self.page = i // self.per_page
+            self._build_page()
+        card = next((c for c in self.cards if c.data is self.entries[i]), None)
+        if card is None:
+            return "Could not show it."
+        self._activate(card)
+        return f"Opening {found[0][1]}."
 
     # ── physics ──────────────────────────────────────────────────────────────────
     def _update_hover(self):
@@ -1624,6 +1991,9 @@ class Space:
             c.k += ((1.0 if c.open else 0.0) - c.k) * min(1.0, 9 * dt)
             c.lift += ((1.0 if c.held else 0.0) - c.lift) * min(1.0, 12 * dt)
             c.hov += ((1.0 if c is self.hover_card and not c.open else 0.0) - c.hov) * min(1.0, 14 * dt)
+            if c.open and c.data.get("kind") == "map":
+                self.mapview.set_window(c.ow, c.oh)
+                self.mapview.step(dt, _tau(c._rin), 0.09)
             if c.yaw != c.yaw_t or c.pitch != c.pitch_t:         # hand input comes at the camera's rate; the turn is drawn at the screen's
                 ea = 1.0 - math.exp(-dt / _tau(c._rin))
                 c.yaw += (c.yaw_t - c.yaw) * ea

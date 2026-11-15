@@ -21,6 +21,8 @@ from PyQt6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QGuiApplication, Q
 from PyQt6.QtWidgets import QWidget
 
 from core.hand_space import Card, Space, human_size
+from core import map_service, space_feeds
+from core.space_map import TILE as MAP_TILE, ancestor as map_ancestor
 from ui import hs_gpu, mesh_thumb
 from ui.fx import GL_ENABLED, samples_for
 from ui.hand_overlay import BONES
@@ -140,6 +142,13 @@ class HandSpaceOverlay(QWidget):
         self._mthumbs: OrderedDict = OrderedDict()                     # path → QPixmap (the picture a model card shows)
         self._mthumb_jobs: dict[str, Future] = {}
         self._mthumb_failed: set[str] = set()
+        self._npool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hs-net")      # calendar / mail / expenses / place search
+        self._njobs: list[Future] = []
+        self._tiles = None                                           # map_service.TileStore, created when the map is first opened
+        self._geo = None
+        self._tilepx: OrderedDict = OrderedDict()                    # (z, x, y) → QPixmap (one GPU texture each)
+        self._tile_req = ()
+        self._tile_req_t = 0.0
         self._mjobs: dict[str, Future] = {}
         self._mdata: dict[str, tuple] = {}
         self._mfail: dict[str, str] = {}
@@ -170,7 +179,19 @@ class HandSpaceOverlay(QWidget):
         scr = QGuiApplication.primaryScreen().geometry()
         self.setGeometry(scr)
         self.space.resize(scr.width(), scr.height())
+        cfg = read_cfg()
+        self.space.virtual = bool(cfg.get("hs_extra_cards", True))     # Map / Calendar / Mail / Expenses beside the drives
         self.space.start(pinned)                       # always begins on "This PC": the drives, C: first
+                               # each open-hand gesture can be switched off in the config
+        self.space.g_swipe = bool(cfg.get("hs_swipe", True))
+        self.space.g_palm = bool(cfg.get("hs_palm_pause", True))
+        self.space.g_twist = bool(cfg.get("hs_twist_volume", True))
+        home = cfg.get("hs_map_home")                  # [latitude, longitude, zoom] the map starts at (default: the whole world)
+        try:
+            if isinstance(home, (list, tuple)) and len(home) == 3:
+                self.space.mapview.jump(float(home[0]), float(home[1]), float(home[2]))
+        except (TypeError, ValueError):
+            pass
         self.space.close_requested = False
         self._bg = None
         self._why = ""
@@ -183,6 +204,24 @@ class HandSpaceOverlay(QWidget):
         if self._cv is not None:
             self._cv.setGeometry(self.rect())
             QTimer.singleShot(700, self._check_gl)
+
+    def _net_job(self, req: tuple):
+        """Runs in a worker thread: one calendar / mail / expenses / receipt job, or a place search."""
+        if req[0] == "geocode":
+            if self._geo is None:
+                self._geo = map_service.Geocoder(lang=str(read_cfg().get("hs_map_lang") or "en"))
+            return "geocode", self._geo.search(req[1])
+        return space_feeds.handle(req)
+
+    def _tile_store(self):
+        if self._tiles is None:
+            self._tiles = map_service.TileStore(str(read_cfg().get("hs_map_tiles") or map_service.OSM_TEMPLATE))
+        return self._tiles
+
+    def voice(self, cmd: str):
+        """A spoken command from the hand_control tool, \"verb\" or \"verb:argument\" — the Space only runs allow-listed verbs."""
+        verb, _, arg = str(cmd).partition(":")
+        self.space.voice(verb, arg)
 
     def _gl_why(self) -> str:
         """The real reason the 3D models / GPU video are off, instead of a one-size-fits-all guess."""
@@ -228,6 +267,8 @@ class HandSpaceOverlay(QWidget):
         for f in self._mjobs.values():
             f.cancel()
         self._mjobs.clear()
+        self._tilepx.clear()                                         # the map's tiles are GPU textures: let them go with the window
+        self._tile_req = ()
         self._mdata.clear()
         self._mfail.clear()
         self._vfail.clear()
@@ -327,6 +368,30 @@ class HandSpaceOverlay(QWidget):
                 self._mdata[path] = fut.result()
             except Exception as e:
                 self._mfail[path] = str(e) or "unreadable"
+        sp = self.space
+        while sp.requests:                                               # jobs the Space asked for → worker threads
+            req = sp.requests.pop(0)
+            if len(self._njobs) >= 8:
+                sp.deliver("toast", "Still busy — try again in a moment")
+                break
+            self._njobs.append(self._npool.submit(self._net_job, req))
+        for fut in [f for f in self._njobs if f.done()]:
+            self._njobs.remove(fut)
+            try:
+                what, payload = fut.result()
+            except map_service.MapError as e:
+                what, payload = "geocode", str(e)
+            except Exception:
+                what, payload = "toast", "That didn't work."
+            sp.deliver(what, payload)
+        if self._tiles is not None:                                      # downloaded tiles → GPU textures, a few per frame
+            for key, data in self._tiles.poll(3):
+                img = QImage.fromData(data)
+                if not img.isNull():
+                    self._tilepx[key] = QPixmap.fromImage(img)
+                    self._tilepx.move_to_end(key)
+            while len(self._tilepx) > 360:
+                self._tilepx.popitem(last=False)
         for path, fut in list(self._mthumb_jobs.items()):                # finished card pictures → pixmaps (GUI thread)
             if not fut.done():
                 continue
@@ -903,7 +968,7 @@ class HandSpaceOverlay(QWidget):
         appear = 1.0 if fs else c.a
         sc = 1.0 if fs else (0.9 + 0.1 * appear) * (1.0 + 0.05 * c.lift + 0.03 * c.hov)
         kind = c.data.get("kind", "file")
-        accent = QColor({"drive": C.PRI, "folder": C.AMBER, "image": C.PRI, "text": C.ACC, "model": C.ACC, "video": C.PRI}.get(kind, C.TEXT_MED))
+        accent = QColor({"drive": C.PRI, "folder": C.AMBER, "image": C.PRI, "text": C.ACC, "model": C.ACC, "video": C.PRI, "map": C.PRI}.get(kind, C.TEXT_MED))
         p.save()
         p.setOpacity(appear * (0.35 if faded else 1.0))
         p.translate(c.x, c.y)
@@ -961,6 +1026,8 @@ class HandSpaceOverlay(QWidget):
             self._card_video(p, c, rect)
         elif kind == "text":
             self._card_text(p, c, rect)
+        elif kind == "map":
+            self._card_map(p, c, rect)
         elif kind in ("drive", "folder"):
             self._card_place(p, c, rect, accent)
         else:
@@ -1081,6 +1148,104 @@ class HandSpaceOverlay(QWidget):
                        "Programs and scripts are never started from a gesture.")
 
     # notes
+    def _card_map(self, p: QPainter, c: Card, rect: QRectF):
+        d = c.data
+        if c.k <= 0.5:                                                  # resting card: a little globe
+            inner = rect.adjusted(14, 10, -14, -10)
+            self._title(p, QRectF(inner.left(), inner.top(), inner.width(), 26), d["title"], 11, C.PRI)
+            p.setPen(QPen(QColor(C.PRI), 1))
+            p.drawLine(QPointF(inner.left(), inner.top() + 29), QPointF(inner.left() + 34, inner.top() + 29))
+            ctr = QPointF(rect.center().x(), rect.center().y() + 10)
+            r = min(rect.width(), rect.height()) * 0.25
+            p.setBrush(QColor(80, 170, 230, 55))
+            p.setPen(QPen(QColor(C.PRI), 1.6))
+            p.drawEllipse(ctr, r, r)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(C.PRI), 1.0))
+            p.drawEllipse(ctr, r * 0.45, r)
+            p.drawLine(QPointF(ctr.x() - r, ctr.y()), QPointF(ctr.x() + r, ctr.y()))
+            p.drawLine(QPointF(ctr.x(), ctr.y() - r), QPointF(ctr.x(), ctr.y() + r))
+            for k in (-0.55, 0.55):
+                w = r * math.sqrt(1 - k * k)
+                p.drawLine(QPointF(ctr.x() - w, ctr.y() + k * r), QPointF(ctr.x() + w, ctr.y() + k * r))
+            p.setFont(_F(9))
+            p.setPen(QColor(C.TEXT_DIM))
+            p.drawText(QRectF(inner.left(), rect.bottom() - 34, inner.width(), 22), _AL.AlignCenter, d.get("sub", ""))
+            return
+        fs = self._fs and c.open
+        view = rect if fs else rect.adjusted(14, 14, -14, -14)
+        w, h = view.width(), view.height()
+        mv = self.space.mapview
+        Z, sc, tiles = mv.tiles(w, h)
+        store = self._tile_store()
+        p.save()
+        if not fs:
+            clip = QPainterPath()
+            clip.addRoundedRect(view, 12, 12)
+            p.setClipPath(clip)
+        else:
+            p.setClipRect(view)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.fillRect(view, QColor(212, 218, 220))                          # shown until a tile arrives
+        size = MAP_TILE * sc + 0.6                                       # +0.6: no hairline gaps between tiles
+        missing = []
+        for tx, ty, sx, sy in tiles:
+            dest = QRectF(view.left() + sx, view.top() + sy, size, size)
+            if dest.right() < view.left() or dest.left() > view.right() or dest.bottom() < view.top() or dest.top() > view.bottom():
+                continue
+            pm = self._tilepx.get((Z, tx, ty))
+            if pm is not None:
+                p.drawPixmap(dest, pm, QRectF(0, 0, MAP_TILE, MAP_TILE))
+                continue
+            missing.append(((Z, tx, ty), (sx + size / 2 - w / 2) ** 2 + (sy + size / 2 - h / 2) ** 2))
+            for k in (1, 2, 3):                                          # until it arrives: the blurry parent tile
+                a = map_ancestor(Z, tx, ty, k)
+                pm2 = self._tilepx.get(a[:3]) if a else None
+                if pm2 is not None:
+                    ux, uy, usz = a[3]
+                    p.drawPixmap(dest, pm2, QRectF(ux, uy, usz, usz))
+                    break
+        now = time.time()
+        want = tuple(k for k, _ in sorted(missing, key=lambda t: t[1]))
+        if want != self._tile_req and (now - self._tile_req_t > 0.12 or not want):
+            self._tile_req, self._tile_req_t = want, now
+            store.request(list(want))                                     # only what is in view and missing; old requests are dropped
+        if missing and store.online_error and not any(self._tilepx.get((Z, t[0], t[1])) for t in tiles):
+            p.setFont(_F(11))
+            p.setPen(QColor(60, 70, 80))
+            p.drawText(view.adjusted(0, 24, 0, 0), _AL.AlignHCenter | _AL.AlignTop, "The map is offline — showing what is saved")
+        if mv.marker is not None:                                        # the place that was searched for
+            lat, lon, label = mv.marker
+            mx, my = mv.project(lat, lon, w, h)
+            if -40 < mx < w + 40 and -40 < my < h + 40:
+                pt = QPointF(view.left() + mx, view.top() + my)
+                p.setPen(QPen(QColor(255, 255, 255), 2.4))
+                p.setBrush(QColor(226, 54, 54))
+                p.drawEllipse(QPointF(pt.x(), pt.y() - 20), 11, 11)
+                pin = QPolygonF([QPointF(pt.x() - 8, pt.y() - 14), QPointF(pt.x() + 8, pt.y() - 14), pt])
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawPolygon(pin)
+                p.setBrush(QColor(255, 255, 255))
+                p.drawEllipse(QPointF(pt.x(), pt.y() - 20), 4, 4)
+                p.setFont(_F(11, QFont.Weight.DemiBold))
+                tw = QFontMetrics(p.font()).horizontalAdvance(label[:60]) + 16
+                box = QRectF(pt.x() - tw / 2, pt.y() - 62, tw, 24)
+                p.setBrush(QColor(255, 255, 255, 235))
+                p.drawRoundedRect(box, 8, 8)
+                p.setPen(QColor(30, 40, 50))
+                p.drawText(box, _AL.AlignCenter, label[:60])
+        p.setFont(_F(8))                                                 # OpenStreetMap's licence asks for this credit
+        cr = "© OpenStreetMap contributors"
+        cw = QFontMetrics(p.font()).horizontalAdvance(cr) + 12
+        box = QRectF(view.right() - cw - 8, view.bottom() - 24 - (66 if fs else 0), cw, 18)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 215))
+        p.drawRoundedRect(box, 6, 6)
+        p.setPen(QColor(50, 60, 70))
+        p.drawText(box, _AL.AlignCenter, cr)
+        p.restore()
+        p.setPen(Qt.PenStyle.NoPen)
+
     def _card_text(self, p: QPainter, c: Card, rect: QRectF):
         d = c.data
         mono = bool(d.get("mono"))
@@ -1350,3 +1515,11 @@ class HandSpaceOverlay(QWidget):
             p.setFont(_F(10, QFont.Weight.DemiBold))
             p.setPen(QColor(C.AMBER))
             p.drawText(QRectF(pc.x() - 50, pc.y() + 52, 100, 22), _AL.AlignCenter, "Back")
+        if 0.05 < h.palm_prog < 1.0:                           # flat palm held still over a film: a ring fills up, then pause / play
+            pc = QPointF(*h.dpalm)
+            op = self.space.opened
+            p.setPen(QPen(QColor(C.ACC), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawArc(QRectF(pc.x() - 46, pc.y() - 46, 92, 92), 90 * 16, int(-360 * 16 * h.palm_prog))
+            p.setFont(_F(10, QFont.Weight.DemiBold))
+            p.setPen(QColor(C.ACC))
+            p.drawText(QRectF(pc.x() - 50, pc.y() + 52, 100, 22), _AL.AlignCenter, "Play" if (op is not None and op.paused) else "Pause")

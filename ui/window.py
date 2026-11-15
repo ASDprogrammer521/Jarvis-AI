@@ -1757,6 +1757,10 @@ class MainWindow(QMainWindow):
                 return
             if name == "hand_space":
                 ov = self._modules.get("hand_space")
+                if cmd.startswith("do:"):                      # a spoken command for the open Hand Space (allow-listed inside it)
+                    if ov is not None and ov.isVisible():
+                        ov.voice(cmd[3:])
+                    return
                 if cmd == "show" or (cmd == "toggle" and not (ov and ov.isVisible())):
                     self._open_hand_space()
                 elif ov is not None:
@@ -2799,6 +2803,10 @@ class JarvisUI:
 
     def module_command(self, name: str, cmd: str = "toggle"):
         self._win.module_command(name, cmd)
+
+    def module_visible(self, name: str) -> bool:
+        ov = self._win._modules.get(str(name))
+        return bool(ov is not None and ov.isVisible())
 
     def set_hand_cursor(self, on: bool):
         self._win._module_sig.emit("hand_cursor", "on" if on else "off")

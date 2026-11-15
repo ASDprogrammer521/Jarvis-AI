@@ -454,6 +454,11 @@ class GlVideo:
                     pl.pause = bool(val)
                 except Exception:
                     pass
+            elif kind == "volume":
+                try:
+                    pl.volume = max(0, min(100, int(val)))
+                except Exception:
+                    pass
         if abs(seek) > 0.01:
             try:
                 pl.command("seek", seek, "relative+keyframes")
