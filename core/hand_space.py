@@ -234,6 +234,21 @@ def list_dir(path: str | Path, sort: str = "name") -> list[dict]:
     return out
 
 
+def _front_matter(text: str) -> dict:
+    """The `color:` and `icon:` a note carries in its front matter: a card made on the Hand Space page keeps its own look."""
+    m = re.match(r"---\n(.*?)\n---\n", text, flags=re.S)
+    out: dict = {}
+    if m:
+        for line in m.group(1).splitlines():
+            k, _, v = line.partition(":")
+            k, v = k.strip().lower(), v.strip().strip("\"'")
+            if k == "color" and re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+                out["accent"] = v
+            elif k == "icon" and 0 < len(v) <= 4:
+                out["icon"] = v
+    return out
+
+
 def fill_text(e: dict) -> None:
     """Read the start of a note so its card can show a preview (only done for the cards on screen)."""
     if e.get("kind") != "text" or e.get("_filled"):
@@ -250,6 +265,7 @@ def fill_text(e: dict) -> None:
         return
     txt = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\t", "    ")
     if e["_ext"] in (".md", ".markdown"):
+        e.update(_front_matter(txt))
         txt = _clean_md(txt)
     e["full"] = txt[:TEXT_CHARS]
     e["text"] = "\n".join(txt.strip().splitlines()[:8])[:420]
@@ -2082,3 +2098,5 @@ class Space:
         if self._claw_n:
             return "Claw: open your hand to release the cards"
         return "Pinch = grab · tap a folder to go in · tap a picture to enlarge · claw = pull cards · fist (hold) = up one folder"
+
+#by ASDcuber

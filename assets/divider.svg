@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 14" width="1200" height="14" role="presentation">
+<defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#6ee7ff" stop-opacity="0"/><stop offset=".5" stop-color="#6ee7ff"/><stop offset="1" stop-color="#b388ff" stop-opacity="0"/></linearGradient>
+<linearGradient id="h" x1="0" x2="1"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".5" stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<filter id="b"><feGaussianBlur stdDeviation="2.2"/></filter></defs>
+<rect x="0" y="6" width="1200" height="2" rx="1" fill="url(#g)" opacity=".55"/>
+<rect y="5" width="220" height="4" rx="2" fill="url(#h)" filter="url(#b)"><animate attributeName="x" values="-220;1200" dur="5s" repeatCount="indefinite"/></rect>
+<rect y="6" width="140" height="2" rx="1" fill="url(#h)"><animate attributeName="x" values="-140;1200" dur="5s" repeatCount="indefinite"/></rect>
+<circle cx="600" cy="7" r="3.2" fill="#6ee7ff"><animate attributeName="r" values="2.6;4.4;2.6" dur="2.4s" repeatCount="indefinite"/></circle>
+</svg>

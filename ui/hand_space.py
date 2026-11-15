@@ -44,14 +44,62 @@ _ELIDE: dict = {}
 _FM: dict = {}
 
 
-def _F(size, weight=None, family: str = "Segoe UI") -> QFont:
+def _F(size, weight=None, family: str = "Segoe UI", spacing=None) -> QFont:
     """Shared QFont objects: building a font (and its metrics) for every card on every frame was pure CPU waste."""
-    k = (family, size, weight)
+    k = (family, size, weight, spacing)
     f = _FONTS.get(k)
     if f is None:
         f = QFont(family, size) if weight is None else QFont(family, size, weight)
+        if spacing:
+            f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
         _FONTS[k] = f
     return f
+
+
+def _q(c, a: int = 255) -> QColor:
+    """A colour (hex string or QColor) with its own alpha."""
+    col = QColor(c)
+    col.setAlpha(max(0, min(255, int(a))))
+    return col
+
+
+def _mix(a, b, t: float) -> QColor:
+    """Linear blend of two colours (alpha included): t = 0 → a, t = 1 → b."""
+    a, b = QColor(a), QColor(b)
+    t = max(0.0, min(1.0, t))
+    return QColor(int(a.red() + (b.red() - a.red()) * t), int(a.green() + (b.green() - a.green()) * t),
+                  int(a.blue() + (b.blue() - a.blue()) * t), int(a.alpha() + (b.alpha() - a.alpha()) * t))
+
+
+def _accent_for(d: dict) -> str:
+    """Every kind of card has its own accent colour, so a screen full of cards reads at a glance."""
+    kind = d.get("kind", "file")
+    if kind == "text":
+        if d.get("accent"):                                       # a card the user designed keeps its own colour
+            return d["accent"]
+        return {"Calendar": C.PRI, "Mail": C.AMBER, "Expenses": C.GREEN}.get(d.get("title"), C.ACC)
+    return {"drive": C.PRI, "folder": C.AMBER, "image": C.PRI, "model": C.ACC, "video": C.ACC2, "map": C.PRI}.get(kind, C.TEXT_MED)
+
+
+def _emoji_for(d: dict) -> str:
+    """The icon a user picked for a note card (empty for every other card)."""
+    return str(d.get("icon") or "") if d.get("kind") == "text" else ""
+
+
+def _emoji_font(px: int) -> QFont:
+    f = _FONTS.get(("emoji", px))
+    if f is None:
+        f = QFont("Segoe UI Emoji")
+        f.setPixelSize(px)
+        _FONTS[("emoji", px)] = f
+    return f
+
+
+def _glyph_for(d: dict) -> str:
+    kind = d.get("kind", "file")
+    if kind == "text":
+        return {"Calendar": "calendar", "Mail": "mail", "Expenses": "wallet"}.get(d.get("title"), "code" if d.get("mono") else "doc")
+    return {"folder": "folder", "image": "image", "model": "cube", "video": "film", "map": "globe"}.get(kind, "doc")
 
 
 def _elided(text: str, size: int, width: int) -> str:
@@ -576,31 +624,57 @@ class HandSpaceOverlay(QWidget):
         self.space.mouse_hover = None
         super().leaveEvent(e)
 
-    # ── drawing: backdrop ────────────────────────────────────────────────────────────
     def _background(self) -> QPixmap:
+        """Deep-space backdrop: vignette, two soft aurora glows, a dot grid that fades towards the edges. Drawn once per size."""
         W, H = self.width(), self.height()
         if self._bg is None or self._bg.width() != W or self._bg.height() != H:
             bg = QPixmap(W, H)
             bg.fill(Qt.GlobalColor.transparent)
             p = QPainter(bg)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            g = QRadialGradient(QPointF(W / 2, H * 0.55), max(W, H) * 0.8)
-            g.setColorAt(0, QColor(10, 24, 46, 222))
-            g.setColorAt(1, QColor(2, 4, 12, 242))
+            g = QRadialGradient(QPointF(W * 0.5, H * 0.58), max(W, H) * 0.85)
+            g.setColorAt(0.0, QColor(13, 30, 60, 224))
+            g.setColorAt(0.55, QColor(6, 15, 34, 236))
+            g.setColorAt(1.0, QColor(1, 3, 10, 248))
             p.fillRect(QRectF(0, 0, W, H), QBrush(g))
-            p.setPen(Qt.PenStyle.NoPen)                                       # faint dot grid
-            p.setBrush(QColor(110, 231, 255, 22))
-            for x in range(40, W, 48):
-                for y in range(40, H, 48):
-                    p.drawEllipse(QPointF(x, y), 1.1, 1.1)
-            top = QLinearGradient(0, 0, 0, 130)                                # top and bottom bars sit on a darker band
-            top.setColorAt(0, QColor(0, 6, 16, 190))
+            for cx, cy, rad, col in ((W * 0.14, H * 0.08, W * 0.46, C.PRI), (W * 0.9, H * 0.94, W * 0.5, C.ACC),
+                                     (W * 0.62, H * 0.02, W * 0.3, C.ACC2)):                 # aurora glows
+                a = QRadialGradient(QPointF(cx, cy), rad)
+                a.setColorAt(0.0, _q(col, 40))
+                a.setColorAt(0.5, _q(col, 12))
+                a.setColorAt(1.0, _q(col, 0))
+                p.fillRect(QRectF(0, 0, W, H), QBrush(a))
+            p.setPen(Qt.PenStyle.NoPen)                                                       # dot grid, brightest in the middle
+            mx, my, md = W / 2, H * 0.56, math.hypot(W, H) * 0.5
+            step = 44
+            for ix, x in enumerate(range(step, W, step)):
+                for iy, y in enumerate(range(step, H, step)):
+                    t = max(0.0, 1.0 - math.hypot(x - mx, y - my) / md)
+                    p.setBrush(_q(C.PRI, 6 + 40 * t * t))
+                    p.drawEllipse(QPointF(x, y), 1.0 + 0.5 * t, 1.0 + 0.5 * t)
+            p.setBrush(Qt.BrushStyle.NoBrush)                                                 # a few "+" registration marks
+            p.setPen(QPen(_q(C.PRI, 34), 1.0))
+            for x in range(step * 4, W, step * 8):
+                for y in range(step * 4, H, step * 8):
+                    p.drawLine(QPointF(x - 4, y), QPointF(x + 4, y))
+                    p.drawLine(QPointF(x, y - 4), QPointF(x, y + 4))
+            vg = QRadialGradient(QPointF(W / 2, H / 2), math.hypot(W, H) * 0.52)             # vignette
+            vg.setColorAt(0.55, QColor(0, 0, 0, 0))
+            vg.setColorAt(1.0, QColor(0, 0, 0, 150))
+            p.fillRect(QRectF(0, 0, W, H), QBrush(vg))
+            top = QLinearGradient(0, 0, 0, 140)                                               # darker bands under the top / bottom bars
+            top.setColorAt(0, QColor(0, 6, 16, 200))
             top.setColorAt(1, QColor(0, 6, 16, 0))
-            p.fillRect(QRectF(0, 0, W, 130), QBrush(top))
-            bot = QLinearGradient(0, H - 150, 0, H)
+            p.fillRect(QRectF(0, 0, W, 140), QBrush(top))
+            bot = QLinearGradient(0, H - 160, 0, H)
             bot.setColorAt(0, QColor(0, 6, 16, 0))
-            bot.setColorAt(1, QColor(0, 6, 16, 190))
-            p.fillRect(QRectF(0, H - 150, W, 150), QBrush(bot))
+            bot.setColorAt(1, QColor(0, 6, 16, 205))
+            p.fillRect(QRectF(0, H - 160, W, 160), QBrush(bot))
+            ln = QLinearGradient(0, 0, W, 0)                                                  # hairline of light along the top edge
+            ln.setColorAt(0, _q(C.PRI, 0))
+            ln.setColorAt(0.5, _q(C.PRI, 150))
+            ln.setColorAt(1, _q(C.ACC, 0))
+            p.fillRect(QRectF(0, 0, W, 1.6), QBrush(ln))
             p.end()
             self._bg = bg
         return self._bg
@@ -664,37 +738,24 @@ class HandSpaceOverlay(QWidget):
             dim = max((c.k for c in sp.cards), default=0.0)
             for c in sorted(sp.cards, key=lambda c: (c.open, c.k, c.held, c.lift)):
                 if c.open or c.k > 0.02:
-                    p.fillRect(QRectF(0, 0, W, H), QColor(0, 4, 12, int(170 * dim + 85 * sp.fk)))      # dark scrim behind the open card
+                    p.fillRect(QRectF(0, 0, W, H), QColor(0, 3, 10, int(176 * dim + 80 * sp.fk)))      # dark scrim behind the open card
                     dim = 0.0
                 self._draw_card(p, c, faded=op is not None and not c.open and c.k < 0.02)
             if sp.empty:
-                p.setFont(_F(16))
-                p.setPen(QColor(C.TEXT_DIM))
-                p.drawText(QRectF(0, H / 2 - 20, W, 40), _AL.AlignCenter, "This folder is empty")
+                self._draw_empty(p, W, H)
             self._draw_topbar(p, W)
             if sp.prompt is None:
                 if sp.menu_box is not None:
                     self._draw_menu_panel(p, sp.menu_box)
+                if op is not None:
+                    self._draw_dock(p)
                 for b in sp.buttons:
                     self._draw_button(p, b)
             if sp.pages > 1 and op is None:
-                p.setFont(_F(12, QFont.Weight.DemiBold))
-                p.setPen(QColor(C.TEXT_MED))
-                p.drawText(QRectF(W / 2 - 70, H - 112, 140, 52), _AL.AlignCenter, f"Page {sp.page + 1} / {sp.pages}")
-            p.setFont(_F(10))
-            p.setPen(QColor(C.TEXT_DIM))
-            p.drawText(QRectF(0, H - 50, W, 30), _AL.AlignHCenter | _AL.AlignVCenter, sp.hint + "      ·      Esc / ✕ to leave")
-        t = sp.toast
-        if t:
-            p.setFont(_F(11))
-            fm = QFontMetrics(p.font())
-            tw = fm.horizontalAdvance(t) + 44
-            r = QRectF((W - tw) / 2, H - 172, tw, 38)
-            p.setBrush(QColor(10, 24, 46, 230))
-            p.setPen(QPen(QColor(C.PRI), 1))
-            p.drawRoundedRect(r, 19, 19)
-            p.setPen(QColor(C.TEXT))
-            p.drawText(r, _AL.AlignCenter, t)
+                self._draw_pager(p, W, H)
+            self._draw_hint(p, W, H)
+        if sp.toast:
+            self._draw_toast(p, W, H, sp.toast)
         if sp.prompt is not None:
             self._draw_prompt(p, W, H)
             for b in sp.buttons:
@@ -712,14 +773,14 @@ class HandSpaceOverlay(QWidget):
         d = c.data
         p.save()
         p.setOpacity(a)
-        top = QLinearGradient(0, 0, 0, 120)
-        top.setColorAt(0, QColor(0, 0, 0, 170))
+        top = QLinearGradient(0, 0, 0, 130)
+        top.setColorAt(0, QColor(0, 0, 0, 185))
         top.setColorAt(1, QColor(0, 0, 0, 0))
-        p.fillRect(QRectF(0, 0, W, 120), QBrush(top))
-        bot = QLinearGradient(0, H - 190, 0, H)
+        p.fillRect(QRectF(0, 0, W, 130), QBrush(top))
+        bot = QLinearGradient(0, H - 210, 0, H)
         bot.setColorAt(0, QColor(0, 0, 0, 0))
-        bot.setColorAt(1, QColor(0, 0, 0, 190))
-        p.fillRect(QRectF(0, H - 190, W, 190), QBrush(bot))
+        bot.setColorAt(1, QColor(0, 0, 0, 205))
+        p.fillRect(QRectF(0, H - 210, W, 210), QBrush(bot))
         info = d["title"]
         kind = d.get("kind")
         if kind == "image" and d.get("dims"):
@@ -728,132 +789,162 @@ class HandSpaceOverlay(QWidget):
             info += f"   ·   {self._tris[d['path']]:,} triangles"
         if kind in ("image", "model") and abs(c.zoom - 1.0) > 0.01:
             info += f"   ·   {int(c.zoom * 100)}%"
-        self._title(p, QRectF(40, 28, W - 120, 36), info, 13, "#ffffff")
+        acc = QColor(_accent_for(d))
+        self._chip(p, QRectF(40, 28, 36, 36), acc, _glyph_for(d), _emoji_for(d))
+        self._title(p, QRectF(90, 28, W - 170, 36), info, 14, "#ffffff")
         if kind == "video" and self._video.active:
             pos, dur, _asp, _end = self._video.info()
             bw = min(W * 0.6, 900.0)
-            bar = QRectF((W - bw) / 2, H - 150, bw, 5)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 255, 255, 60))
-            p.drawRoundedRect(bar, 2.5, 2.5)
-            if dur > 0:
-                p.setBrush(QColor(C.PRI))
-                p.drawRoundedRect(QRectF(bar.left(), bar.top(), max(5.0, bar.width() * min(1.0, pos / dur)), 5), 2.5, 2.5)
-            p.setFont(_F(9))
-            p.setPen(QColor(255, 255, 255, 230))
+            bar = QRectF((W - bw) / 2, H - 156, bw, 6)
+            self._scrub(p, bar, (pos / dur) if dur > 0 else 0.0)
+            p.setFont(_F(10, QFont.Weight.DemiBold))
+            p.setPen(QColor(255, 255, 255, 235))
             tm = lambda x: f"{int(x) // 60}:{int(x) % 60:02d}"                  # noqa: E731
-            p.drawText(QRectF(bar.left(), bar.top() - 22, bar.width(), 20), _AL.AlignRight | _AL.AlignVCenter, f"{tm(pos)} / {tm(dur)}")
+            p.drawText(QRectF(bar.left(), bar.top() - 26, 120, 22), _AL.AlignLeft | _AL.AlignVCenter, tm(pos))
+            p.setPen(QColor(255, 255, 255, 170))
+            p.drawText(QRectF(bar.right() - 120, bar.top() - 26, 120, 22), _AL.AlignRight | _AL.AlignVCenter, tm(dur))
+        self._draw_dock(p)
         for b in sp.buttons:
             self._draw_button(p, b)
         p.restore()
 
     def _draw_menu_panel(self, p: QPainter, box: tuple):
         r = QRectF(*box)
-        p.setPen(QPen(QColor(C.PRI), 1.0))
-        p.setBrush(QColor(8, 20, 40, 244))
-        p.drawRoundedRect(r, 16, 16)
+        self._glass(p, r, 20, C.PRI, 0.0, dark=True, shadow=True)
         for b in self.space.buttons:                                    # a thin rule above Delete
             if b["id"] == "a_delete":
-                p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+                ln = QLinearGradient(b["x"], 0, b["x"] + b["w"], 0)
+                ln.setColorAt(0, QColor(255, 255, 255, 0))
+                ln.setColorAt(0.5, QColor(255, 255, 255, 56))
+                ln.setColorAt(1, QColor(255, 255, 255, 0))
+                p.setPen(QPen(QBrush(ln), 1))
                 p.drawLine(QPointF(b["x"] + 8, b["y"] - 3), QPointF(b["x"] + b["w"] - 8, b["y"] - 3))
 
     def _draw_prompt(self, p: QPainter, W: int, H: int):
         pr = self.space.prompt
-        p.fillRect(QRectF(0, 0, W, H), QColor(0, 4, 12, 200))
-        box = QRectF(W / 2 - 330, H / 2 - 90, 660, 200)
-        p.setBrush(QColor(12, 28, 52, 245))
-        p.setPen(QPen(QColor(C.PRI), 1.4))
-        p.drawRoundedRect(box, 20, 20)
-        p.setFont(_F(14, QFont.Weight.DemiBold))
+        sc = QRadialGradient(QPointF(W / 2, H / 2), max(W, H) * 0.7)
+        sc.setColorAt(0, QColor(2, 8, 20, 190))
+        sc.setColorAt(1, QColor(0, 2, 8, 232))
+        p.fillRect(QRectF(0, 0, W, H), QBrush(sc))
+        box = QRectF(W / 2 - 330, H / 2 - 100, 660, 252)
+        self._glass(p, box, 26, C.PRI, 0.0, dark=True, shadow=True)
+        self._chip(p, QRectF(box.x() + 28, box.y() + 22, 34, 34), QColor(C.PRI), "doc")
+        p.setFont(_F(15, QFont.Weight.DemiBold))
         p.setPen(QColor(C.TEXT))
-        p.drawText(QRectF(box.x() + 28, box.y() + 14, box.width() - 56, 32), _AL.AlignLeft | _AL.AlignVCenter, pr["title"])
-        fld = QRectF(box.x() + 28, box.y() + 54, box.width() - 56, 44)
-        p.setBrush(QColor(0, 0, 0, 120))
-        p.setPen(QPen(QColor(255, 120, 120) if pr["error"] else QColor(C.PRI), 1.2))
-        p.drawRoundedRect(fld, 10, 10)
+        p.drawText(QRectF(box.x() + 76, box.y() + 22, box.width() - 104, 34), _AL.AlignLeft | _AL.AlignVCenter, pr["title"])
+        fld = QRectF(box.x() + 28, box.y() + 74, box.width() - 56, 48)
+        bad = bool(pr["error"])
+        ecol = QColor(255, 110, 130) if bad else QColor(C.PRI)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 4, 14, 170))
+        p.drawRoundedRect(fld, 12, 12)
+        self._glow(p, fld, 12, ecol, 0.9, 1.3)
         p.setFont(_F(15))
         fm = QFontMetrics(p.font())
         txt, cur, s0 = pr["text"], pr["cur"], pr["sel0"]
-        x0 = fld.x() + 14
+        x0 = fld.x() + 16
         lo, hi = min(cur, s0), max(cur, s0)
         if lo != hi:
-            p.fillRect(QRectF(x0 + fm.horizontalAdvance(txt[:lo]), fld.y() + 8, fm.horizontalAdvance(txt[lo:hi]), fld.height() - 16), QColor(60, 140, 255, 130))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(_q(C.PRI, 90))
+            p.drawRoundedRect(QRectF(x0 + fm.horizontalAdvance(txt[:lo]), fld.y() + 9, fm.horizontalAdvance(txt[lo:hi]), fld.height() - 18), 4, 4)
         p.setPen(QColor(C.TEXT))
-        p.drawText(QRectF(x0, fld.y(), fld.width() - 28, fld.height()), _AL.AlignLeft | _AL.AlignVCenter, txt)
+        p.drawText(QRectF(x0, fld.y(), fld.width() - 32, fld.height()), _AL.AlignLeft | _AL.AlignVCenter, txt)
         if int(time.time() * 2) % 2 == 0:
             cx = x0 + fm.horizontalAdvance(txt[:cur])
-            p.setPen(QPen(QColor(C.TEXT), 1.6))
-            p.drawLine(QPointF(cx, fld.y() + 9), QPointF(cx, fld.bottom() - 9))
-        if pr["error"]:
+            p.setPen(QPen(_q(C.PRI, 255), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(cx, fld.y() + 11), QPointF(cx, fld.bottom() - 11))
+        if bad:
             p.setFont(_F(10))
-            p.setPen(QColor(255, 140, 140))
-            p.drawText(QRectF(fld.x(), fld.bottom() + 4, fld.width(), 20), _AL.AlignLeft | _AL.AlignVCenter, pr["error"])
+            p.setPen(QColor(255, 140, 156))
+            p.drawText(QRectF(fld.x() + 2, fld.bottom() + 6, fld.width(), 20), _AL.AlignLeft | _AL.AlignVCenter, pr["error"])
 
     # ── top bar ──────────────────────────────────────────────────────────────────────
     def _draw_topbar(self, p: QPainter, W: int):
         sp = self.space
         left = 40 + 2 * (76 + 12) + 14
         right = min((b["x"] for b in sp.buttons if b["id"] in ("arrange", "sort", "select", "close")), default=W - 40) - 18
-        r = QRectF(left, 30, max(100, right - left), 34)
-        p.setFont(_F(15, QFont.Weight.DemiBold))
+        bar = QLinearGradient(0, 30, 0, 88)                                  # a slim accent bar in front of the title
+        bar.setColorAt(0, _q(C.PRI, 255))
+        bar.setColorAt(1, _q(C.ACC, 255))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(bar))
+        p.drawRoundedRect(QRectF(left - 6, 32, 3.5, 54), 1.75, 1.75)
+        r = QRectF(left + 12, 28, max(100, right - left - 12), 34)
+        p.setFont(_F(19, QFont.Weight.DemiBold))
         p.setPen(QColor(C.TEXT))
         fm = QFontMetrics(p.font())
         p.drawText(r, _AL.AlignLeft | _AL.AlignVCenter, fm.elidedText(sp.crumb, Qt.TextElideMode.ElideLeft, int(r.width())))
-        p.setFont(_F(10))
-        p.setPen(QColor(C.GREEN if sp.select else C.TEXT_DIM))
-        p.drawText(QRectF(left, 64, r.width(), 24), _AL.AlignLeft | _AL.AlignVCenter,
-                   f"{len(sp.sel)} selected" if sp.select else sp.summary)
+        sel = bool(sp.select)
+        col = QColor(C.GREEN if sel else C.TEXT_DIM)
+        p.setBrush(col)
+        p.drawEllipse(QPointF(r.left() + 3, 76), 3.0, 3.0)
+        p.setFont(_F(10, spacing=0.4))
+        p.setPen(col)
+        p.drawText(QRectF(r.left() + 14, 64, r.width() - 14, 24), _AL.AlignLeft | _AL.AlignVCenter,
+                   f"{len(sp.sel)} selected" if sel else sp.summary)
 
     # ── buttons ──────────────────────────────────────────────────────────────────────
     def _draw_button(self, p: QPainter, b: dict):
         sp = self.space
+        bid = b["id"]
         r = QRectF(b["x"], b["y"], b["w"], b["h"])
-        hot = sp.hover_btn == b["id"] and b["on"]
-        age = time.time() - sp.flash.get(b["id"], 0.0)
+        on = bool(b["on"])
+        hot = sp.hover_btn == bid and on
+        age = time.time() - sp.flash.get(bid, 0.0)
         pulse = max(0.0, 1.0 - age / 0.3)
-        a = 1.0 if b["on"] else 0.32
+        a = 1.0 if on else 0.36
         if b.get("menu"):                                              # a row of the ⋯ menu: flat, left-aligned text
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 90, 90, 60 if b["danger"] else 0) if not hot else QColor(150, 210, 255, 50))
-            p.drawRoundedRect(r, 10, 10)
-            col = QColor(255, 130, 130) if b["id"] == "a_delete" else QColor(C.TEXT if b["on"] else C.TEXT_DIM)
+            kill = bid == "a_delete"
+            rr = r.adjusted(2, 1, -2, -1)
+            if hot or (kill and b["danger"]):
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 92, 122, 64 if hot else 36) if kill else _q(C.PRI, 42))
+                p.drawRoundedRect(rr, 12, 12)
+                if hot:
+                    p.setBrush(QColor(255, 92, 122) if kill else QColor(C.PRI))
+                    p.drawRoundedRect(QRectF(rr.left() + 6, rr.center().y() - 9, 3, 18), 1.5, 1.5)
+            col = QColor(255, 138, 156) if kill else QColor("#ffffff" if hot else (C.TEXT if on else C.TEXT_DIM))
             col.setAlpha(int(255 * a))
             p.setFont(_F(11, QFont.Weight.DemiBold))
             p.setPen(col)
-            p.drawText(QRectF(r.left() + 16, r.top(), r.width() - 24, r.height()), _AL.AlignLeft | _AL.AlignVCenter, b["label"])
+            p.drawText(QRectF(r.left() + 24, r.top(), r.width() - 32, r.height()), _AL.AlignLeft | _AL.AlignVCenter, b["label"])
             return
-        fill = QColor(150, 210, 255, int((26 + 44 * hot + 80 * pulse) * (1 if b["on"] else 0.6)))
-        p.setBrush(fill)
-        edge = QColor(C.PRI)
-        edge.setAlpha(int((130 + 110 * hot) * a))
-        p.setPen(QPen(edge, 1.6 if hot else 1.1))
-        rr = r.adjusted(-2 * pulse, -2 * pulse, 2 * pulse, 2 * pulse)
-        p.drawRoundedRect(rr, 14, 14)
-        if b.get("active") or b.get("danger"):
-            tint = QColor(255, 90, 90, 70) if b.get("danger") else QColor(60, 220, 150, 60)
-            p.setBrush(tint)
-            p.setPen(QPen(QColor(255, 110, 110) if b.get("danger") else QColor(C.GREEN), 1.6))
-            p.drawRoundedRect(r, 14, 14)
-        col = QColor(C.TEXT if b["on"] else C.TEXT_DIM)
-        col.setAlpha(int(255 * a))
-        icon_rect = QRectF(r.center().x() - 11 - (22 if b["label"] else 0), r.center().y() - 11, 22, 22)
-        if not b["label"]:
-            icon_rect = QRectF(r.center().x() - 11, r.center().y() - 11, 22, 22)
+        p.save()
+        p.setOpacity(p.opacity() * a)
+        circle = bid == "close"
+        danger = bool(b.get("danger")) or (circle and hot)
+        active = bool(b.get("active")) and not danger
+        tint = QColor(255, 92, 122) if danger else QColor(C.GREEN) if active else None
+        accent = tint if tint is not None else QColor(C.PRI)
+        rr = r.adjusted(-3 * pulse, -3 * pulse, 3 * pulse, 3 * pulse)
+        rad = rr.height() / 2 if circle else 17.0
+        self._glass(p, rr, rad, accent, 1.0 if hot else 0.0, dark=False, tint=tint)
+        if pulse > 0.02:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, int(64 * pulse)))
+            p.drawRoundedRect(rr, rad, rad)
+        if hot or active or danger:
+            self._glow(p, rr.adjusted(0.5, 0.5, -0.5, -0.5), rad, accent, 0.85 if hot else 0.55, 1.2)
+        col = QColor("#ffffff") if (hot or danger) else QColor("#d6ffe9") if active else QColor(C.TEXT if on else C.TEXT_DIM)
         ico = {"v_prev": "left", "v_next": "right", "pg_prev": "left", "pg_next": "right", "v_plus": "plus",
                "v_play": "play" if (sp.opened is not None and sp.opened.paused) else "pause",
                "v_minus": "minus", "v_open": "ext", "v_close": "close", "close": "close", "home": "home", "up": "up",
                "explorer": "folder", "sort": "sort", "arrange": "grid", "a_more": "more",
-               "v_full": "shrink" if sp.full else "expand"}.get(b["id"])
-        textonly = ico is None
-        if ico:
-            self._icon(p, ico, icon_rect, col)
-        if b["label"]:
+               "v_full": "shrink" if sp.full else "expand"}.get(bid)
+        label = b["label"]
+        if ico and label:                                              # icon on the left, text after it
+            self._icon(p, ico, QRectF(r.left() + 18, r.center().y() - 11, 22, 22), col)
             p.setFont(_F(11, QFont.Weight.DemiBold))
             p.setPen(col)
-            if textonly:
-                p.drawText(r, _AL.AlignCenter, b["label"])
-            else:
-                p.drawText(QRectF(r.left() + 46, r.top(), r.width() - 52, r.height()), _AL.AlignLeft | _AL.AlignVCenter, b["label"])
+            p.drawText(QRectF(r.left() + 50, r.top(), r.width() - 58, r.height()), _AL.AlignLeft | _AL.AlignVCenter, label)
+        elif ico:
+            self._icon(p, ico, QRectF(r.center().x() - 11, r.center().y() - 11, 22, 22), col)
+        elif label:
+            p.setFont(_F(11, QFont.Weight.DemiBold))
+            p.setPen(col)
+            p.drawText(r, _AL.AlignCenter, label)
+        p.restore()
 
     @staticmethod
     def _icon(p: QPainter, kind: str, r: QRectF, col: QColor):
@@ -925,37 +1016,59 @@ class HandSpaceOverlay(QWidget):
                     p.drawRoundedRect(QRectF(x + 2 + i * 10, y + 2 + j * 10, 8, 8), 2, 2)
 
     # ── cards ────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _body(q: QPainter, rect: QRectF, accent: QColor, rad: float = 18.0, strong: float = 0.0):
+        """The glass body of a card: layered shadow, tinted frosted fill, gradient rim, sheen and a lit top edge."""
+        k = 1.0 + 0.38 * strong
+        q.setPen(Qt.PenStyle.NoPen)
+        for i, al in enumerate((24, 15, 8)):
+            g = 3 + i * 5
+            q.setBrush(QColor(0, 0, 0, al))
+            q.drawRoundedRect(rect.adjusted(-g, -g + 9, g, g + 9), rad + g, rad + g)
+        fill = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        fill.setColorAt(0, QColor(38, 66, 118, min(255, int(150 * k))))
+        fill.setColorAt(1, QColor(10, 21, 48, min(255, int(176 * k))))
+        q.setBrush(fill)
+        q.drawRoundedRect(rect, rad, rad)
+        tint = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        tint.setColorAt(0, _q(accent, 40))
+        tint.setColorAt(0.65, _q(accent, 6))
+        tint.setColorAt(1, _q(accent, 0))
+        q.setBrush(tint)
+        q.drawRoundedRect(rect, rad, rad)
+        sheen = QPainterPath()
+        sheen.addRoundedRect(rect.adjusted(2, 2, -2, -rect.height() * 0.55), rad - 2, rad - 2)
+        q.setBrush(QColor(255, 255, 255, 13))
+        q.drawPath(sheen)
+        rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        rim.setColorAt(0, QColor(255, 255, 255, 120))
+        rim.setColorAt(0.45, QColor(255, 255, 255, 26))
+        rim.setColorAt(1, _q(accent, 120))
+        q.setBrush(Qt.BrushStyle.NoBrush)
+        q.setPen(QPen(QBrush(rim), 1.2))
+        q.drawRoundedRect(rect.adjusted(0.6, 0.6, -0.6, -0.6), rad - 0.6, rad - 0.6)
+        ln = QLinearGradient(rect.left() + rad, 0, rect.right() - rad, 0)
+        ln.setColorAt(0, _q(accent, 0))
+        ln.setColorAt(0.5, _q(accent, 230))
+        ln.setColorAt(1, _q(accent, 0))
+        q.setPen(QPen(QBrush(ln), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        q.drawLine(QPointF(rect.left() + rad, rect.top() + 0.9), QPointF(rect.right() - rad, rect.top() + 0.9))
+
     def _chrome(self, w: float, h: float, accent: QColor) -> QPixmap:
-        """The glass body of a resting card (shadow, fill, border, sheen) drawn once and reused: no gradients per card per frame."""
+        """The glass body of a resting card drawn once and reused: no gradients per card per frame."""
         dpr = float(self.devicePixelRatioF())
         key = (int(w), int(h), accent.rgb(), dpr)
         pm = self._chromes.get(key)
         if pm is None:
             if len(self._chromes) > 60:
                 self._chromes.clear()
-            pad = 16
+            pad = 22
             pm = QPixmap(int((w + 2 * pad) * dpr), int((h + 2 * pad) * dpr))
             pm.setDevicePixelRatio(dpr)
             pm.fill(Qt.GlobalColor.transparent)
             q = QPainter(pm)
             q.setRenderHint(QPainter.RenderHint.Antialiasing)
-            rect = QRectF(pad, pad, w, h)
-            q.setPen(Qt.PenStyle.NoPen)
-            q.setBrush(QColor(0, 0, 0, 44))                                         # one soft shadow
-            q.drawRoundedRect(rect.adjusted(-3, 4, 3, 10), 19, 19)
-            gr = QLinearGradient(rect.topLeft(), rect.bottomRight())
-            gr.setColorAt(0, QColor(150, 210, 255, 66))
-            gr.setColorAt(1, QColor(40, 90, 160, 44))
-            q.setBrush(gr)
-            edge = QColor(accent)
-            edge.setAlpha(150)
-            q.setPen(QPen(edge, 1.2))
-            q.drawRoundedRect(rect, 16, 16)
-            hl = QPainterPath()
-            hl.addRoundedRect(rect.adjusted(2, 2, -2, -h * 0.55), 14, 14)
-            q.setPen(Qt.PenStyle.NoPen)
-            q.setBrush(QColor(255, 255, 255, 12))
-            q.drawPath(hl)
+            self._body(q, QRectF(pad, pad, w, h), accent)
             q.end()
             self._chromes[key] = pm
         return pm
@@ -968,7 +1081,7 @@ class HandSpaceOverlay(QWidget):
         appear = 1.0 if fs else c.a
         sc = 1.0 if fs else (0.9 + 0.1 * appear) * (1.0 + 0.05 * c.lift + 0.03 * c.hov)
         kind = c.data.get("kind", "file")
-        accent = QColor({"drive": C.PRI, "folder": C.AMBER, "image": C.PRI, "text": C.ACC, "model": C.ACC, "video": C.PRI, "map": C.PRI}.get(kind, C.TEXT_MED))
+        accent = QColor(_accent_for(c.data))
         p.save()
         p.setOpacity(appear * (0.35 if faded else 1.0))
         p.translate(c.x, c.y)
@@ -980,42 +1093,40 @@ class HandSpaceOverlay(QWidget):
         if not fs:
             p.setPen(Qt.PenStyle.NoPen)
             if c.k < 0.02 and not c.open:                               # resting card: the cached body
-                p.drawPixmap(QPointF(-w / 2 - 16, -h / 2 - 16), self._chrome(w, h, accent))
-                if c.lift > 0.03:
-                    p.setBrush(QColor(0, 0, 0, int(36 * c.lift)))
-                    p.drawRoundedRect(rect.adjusted(0, 10, 0, 14), 18, 18)
+                if c.lift > 0.03:                                       # picked up: a deeper shadow beneath it
+                    for i, al in enumerate((34, 20, 10)):
+                        g = 4 + i * 7
+                        p.setBrush(QColor(0, 0, 0, int(al * c.lift)))
+                        p.drawRoundedRect(rect.adjusted(-g, -g + 18, g, g + 18), 18 + g, 18 + g)
+                p.drawPixmap(QPointF(-w / 2 - 22, -h / 2 - 22), self._chrome(w, h, accent))
                 if c.hov > 0.02 or c.held:
-                    p.setBrush(QColor(150, 210, 255, int(36 * c.hov)))
-                    edge = QColor(C.GREEN if c.held else accent)
-                    edge.setAlpha(240 if c.held else int(90 + 150 * c.hov))
-                    p.setPen(QPen(edge, 1.8))
-                    p.drawRoundedRect(rect, 16, 16)
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(_q(accent, 30 * c.hov))
+                    p.drawRoundedRect(rect, 18, 18)
+                    self._glow(p, rect, 18, QColor(C.GREEN) if c.held else accent, 1.0 if c.held else c.hov, 1.6)
             else:                                                       # opening / open: its size changes every frame, drawn directly
-                p.setBrush(QColor(0, 0, 0, 44))
-                p.drawRoundedRect(rect.adjusted(-3, 4, 3, 10), 19, 19)
-                gr = QLinearGradient(rect.topLeft(), rect.bottomRight())
-                gr.setColorAt(0, QColor(150, 210, 255, 128))
-                gr.setColorAt(1, QColor(40, 90, 160, 120))
-                p.setBrush(gr)
-                edge = QColor(accent)
-                edge.setAlpha(200)
-                p.setPen(QPen(edge, 1.4))
-                p.drawRoundedRect(rect, 16, 16)
+                self._body(p, rect, accent, 18.0, 1.0)
             if cpath and cpath in self.space.sel:
-                p.setBrush(QColor(60, 220, 150, 40))
-                p.setPen(QPen(QColor(C.GREEN), 2.6))
-                p.drawRoundedRect(rect, 16, 16)
-                cr = QRectF(rect.right() - 34, rect.top() + 8, 26, 26)
-                p.setBrush(QColor(C.GREEN))
                 p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(_q(C.GREEN, 34))
+                p.drawRoundedRect(rect, 18, 18)
+                self._glow(p, rect, 18, QColor(C.GREEN), 1.0, 2.2)
+                cr = QRectF(rect.right() - 38, rect.top() + 10, 28, 28)
+                gg = QLinearGradient(cr.topLeft(), cr.bottomLeft())
+                gg.setColorAt(0, QColor("#8dffc9"))
+                gg.setColorAt(1, QColor(C.GREEN).darker(125))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(gg))
                 p.drawEllipse(cr)
-                p.setPen(QPen(QColor(4, 20, 14), 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                p.drawLine(QPointF(cr.x() + 7, cr.center().y()), QPointF(cr.center().x() - 1, cr.bottom() - 8))
-                p.drawLine(QPointF(cr.center().x() - 1, cr.bottom() - 8), QPointF(cr.right() - 6, cr.y() + 8))
+                p.setPen(QPen(QColor(4, 22, 14), 2.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.drawLine(QPointF(cr.x() + 7.5, cr.center().y() + 0.5), QPointF(cr.center().x() - 1, cr.bottom() - 8.5))
+                p.drawLine(QPointF(cr.center().x() - 1, cr.bottom() - 8.5), QPointF(cr.right() - 7, cr.y() + 8.5))
             elif self.space.select and kind != "drive":
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(QColor(255, 255, 255, 70), 1.2, Qt.PenStyle.DashLine))
-                p.drawRoundedRect(rect.adjusted(5, 5, -5, -5), 13, 13)
+                p.setPen(QPen(QColor(255, 255, 255, 64), 1.2, Qt.PenStyle.DashLine))
+                p.drawRoundedRect(rect.adjusted(6, 6, -6, -6), 13, 13)
+                p.setPen(QPen(QColor(255, 255, 255, 120), 1.6))
+                p.drawEllipse(QRectF(rect.right() - 38, rect.top() + 10, 28, 28))
             if cpath and cpath in self.space.clip_paths:
                 p.setOpacity(appear * 0.55)                               # cut items look faded until pasted
         if kind == "image":
@@ -1043,58 +1154,78 @@ class HandSpaceOverlay(QWidget):
     # drives and folders
     def _card_place(self, p: QPainter, c: Card, rect: QRectF, accent: QColor):
         d = c.data
-        inner = rect.adjusted(16, 12, -16, -12)
-        cx = inner.left() + 46
-        cy = inner.top() + 42
+        inner = rect.adjusted(18, 14, -18, -14)
+        fx, fy = inner.left(), inner.top() + 2
         if d["kind"] == "folder":
-            tab = QPainterPath()
-            tab.addRoundedRect(QRectF(cx - 32, cy - 26, 30, 14), 4, 4)
-            body = QPainterPath()
-            body.addRoundedRect(QRectF(cx - 32, cy - 18, 64, 46), 7, 7)
-            g = QLinearGradient(cx, cy - 18, cx, cy + 28)
-            top = QColor(accent)
-            top.setAlpha(235)
-            bot = QColor(accent).darker(150)
-            bot.setAlpha(235)
-            g.setColorAt(0, top)
-            g.setColorAt(1, bot)
+            glow = QRadialGradient(QPointF(fx + 31, fy + 38), 58)
+            glow.setColorAt(0, _q(accent, 70))
+            glow.setColorAt(1, _q(accent, 0))
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(accent).darker(135))
-            p.drawPath(tab)
-            p.setBrush(g)
-            p.drawPath(body)
-        else:
-            body = QRectF(cx - 36, cy - 16, 72, 36)
-            g = QLinearGradient(body.topLeft(), body.bottomLeft())
-            g.setColorAt(0, QColor(190, 230, 255, 230))
-            g.setColorAt(1, QColor(80, 140, 200, 230))
-            p.setPen(QPen(QColor(C.PRI), 1.4))
-            p.setBrush(g)
-            p.drawRoundedRect(body, 8, 8)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(C.GREEN))
-            p.drawEllipse(QPointF(body.right() - 10, body.bottom() - 9), 3.2, 3.2)
-            p.setBrush(QColor(20, 50, 90, 150))
-            p.drawRoundedRect(QRectF(body.left() + 8, body.bottom() - 11, 26, 4), 2, 2)
-        tx = inner.left() + 100
-        if d["kind"] == "drive":
-            self._title(p, QRectF(tx - 10, inner.top() + 14, inner.right() - tx + 10, 24), d["title"], 11)
-        else:
+            p.setBrush(QBrush(glow))
+            p.drawEllipse(QPointF(fx + 31, fy + 38), 58, 40)
+            p.setBrush(_mix(accent, "#000000", 0.42))
+            p.drawRoundedRect(QRectF(fx, fy, 27, 14), 5, 5)                                     # tab
+            back = QLinearGradient(fx, fy + 6, fx, fy + 44)
+            back.setColorAt(0, _mix(accent, "#000000", 0.30))
+            back.setColorAt(1, _mix(accent, "#000000", 0.50))
+            p.setBrush(QBrush(back))
+            p.drawRoundedRect(QRectF(fx, fy + 7, 62, 38), 7, 7)                                 # back panel
+            front = QLinearGradient(fx, fy + 15, fx, fy + 47)
+            front.setColorAt(0, _mix(accent, "#ffffff", 0.22))
+            front.setColorAt(1, _mix(accent, "#000000", 0.14))
+            p.setBrush(QBrush(front))
+            p.drawRoundedRect(QRectF(fx, fy + 15, 62, 32), 7, 7)                                # front panel
+            p.setPen(QPen(QColor(255, 255, 255, 110), 1.1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(fx + 7, fy + 16.2), QPointF(fx + 55, fy + 16.2))
             self._title(p, QRectF(inner.left(), inner.bottom() - 52, inner.width(), 26), d["title"], 12)
+            p.setFont(_F(9))
+            p.setPen(QColor(C.TEXT_DIM))
+            p.drawText(QRectF(inner.left(), inner.bottom() - 26, inner.width(), 20), _AL.AlignLeft | _AL.AlignVCenter, d.get("sub", ""))
+            return
+        used = max(0.0, min(1.0, d.get("used", 0.0)))
+        warn = QColor(C.RED if used > 0.9 else C.AMBER if used > 0.75 else C.PRI)
+        body = QRectF(fx, fy + 4, 60, 36)                                                       # the drive itself
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 60))
+        p.drawRoundedRect(body.adjusted(-2, 5, 2, 5), 11, 11)
+        g = QLinearGradient(body.topLeft(), body.bottomLeft())
+        g.setColorAt(0, QColor(214, 238, 255, 240))
+        g.setColorAt(1, QColor(84, 138, 205, 240))
+        p.setBrush(QBrush(g))
+        p.drawRoundedRect(body, 10, 10)
+        p.setBrush(QColor(20, 50, 96, 120))
+        p.drawRoundedRect(QRectF(body.left() + 8, body.bottom() - 13, 28, 4), 2, 2)
+        p.setBrush(QColor(20, 50, 96, 70))
+        p.drawRoundedRect(QRectF(body.left() + 8, body.bottom() - 20, 18, 3), 1.5, 1.5)
+        led = QColor(C.GREEN if d.get("sub") != "Not ready" and used <= 0.9 else C.RED)
+        p.setBrush(_q(led, 60))
+        p.drawEllipse(QPointF(body.right() - 11, body.bottom() - 11), 6.5, 6.5)
+        p.setBrush(led)
+        p.drawEllipse(QPointF(body.right() - 11, body.bottom() - 11), 3.2, 3.2)
+        p.setPen(QPen(QColor(255, 255, 255, 150), 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(body.adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
+        tx = inner.left() + 74
+        self._title(p, QRectF(tx, inner.top() + 2, inner.right() - tx, 22), d["title"], 11)
+        p.setFont(_F(9, QFont.Weight.DemiBold))
+        p.setPen(warn)
+        p.drawText(QRectF(tx, inner.top() + 26, inner.right() - tx, 18), _AL.AlignLeft | _AL.AlignVCenter, f"{int(round(used * 100))}% used")
+        bar = QRectF(inner.left(), inner.bottom() - 34, inner.width(), 8)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 26))
+        p.drawRoundedRect(bar, 4, 4)
+        fw = max(8.0, bar.width() * used)
+        fill = QRectF(bar.left(), bar.top(), fw, bar.height())
+        p.setBrush(_q(warn, 46))
+        p.drawRoundedRect(fill.adjusted(-2, -3, 2, 3), 6, 6)                                    # soft glow under the bar
+        fg = QLinearGradient(fill.left(), 0, fill.right(), 0)
+        fg.setColorAt(0, _mix(warn, "#000000", 0.25))
+        fg.setColorAt(1, _mix(warn, "#ffffff", 0.18))
+        p.setBrush(QBrush(fg))
+        p.drawRoundedRect(fill, 4, 4)
         p.setFont(_F(9))
         p.setPen(QColor(C.TEXT_DIM))
-        if d["kind"] == "drive":
-            bar = QRectF(inner.left(), inner.bottom() - 34, inner.width(), 8)
-            p.setBrush(QColor(255, 255, 255, 30))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(bar, 4, 4)
-            used = max(0.0, min(1.0, d.get("used", 0.0)))
-            p.setBrush(QColor(C.RED if used > 0.9 else C.AMBER if used > 0.75 else C.PRI))
-            p.drawRoundedRect(QRectF(bar.left(), bar.top(), max(8.0, bar.width() * used), bar.height()), 4, 4)
-            p.setPen(QColor(C.TEXT_DIM))
-            p.drawText(QRectF(inner.left(), inner.bottom() - 22, inner.width(), 20), _AL.AlignLeft | _AL.AlignVCenter, d.get("sub", ""))
-        else:
-            p.drawText(QRectF(inner.left(), inner.bottom() - 26, inner.width(), 20), _AL.AlignLeft | _AL.AlignVCenter, d.get("sub", ""))
+        p.drawText(QRectF(inner.left(), inner.bottom() - 22, inner.width(), 20), _AL.AlignLeft | _AL.AlignVCenter, d.get("sub", ""))
 
     # generic files (zip, pdf, exe …)
     def _card_file(self, p: QPainter, c: Card, rect: QRectF):
@@ -1102,22 +1233,43 @@ class HandSpaceOverlay(QWidget):
         if c.k > 0.5:
             self._open_file(p, c, rect)
             return
-        inner = rect.adjusted(16, 12, -16, -12)
+        inner = rect.adjusted(18, 14, -18, -14)
         pg = QRectF(inner.left() + 6, inner.top() + 2, 40, 52)
         path = QPainterPath()
-        path.moveTo(pg.left(), pg.top())
+        path.moveTo(pg.left() + 5, pg.top())
         path.lineTo(pg.right() - 12, pg.top())
         path.lineTo(pg.right(), pg.top() + 12)
-        path.lineTo(pg.right(), pg.bottom())
-        path.lineTo(pg.left(), pg.bottom())
+        path.lineTo(pg.right(), pg.bottom() - 5)
+        path.quadTo(pg.right(), pg.bottom(), pg.right() - 5, pg.bottom())
+        path.lineTo(pg.left() + 5, pg.bottom())
+        path.quadTo(pg.left(), pg.bottom(), pg.left(), pg.bottom() - 5)
+        path.lineTo(pg.left(), pg.top() + 5)
+        path.quadTo(pg.left(), pg.top(), pg.left() + 5, pg.top())
         path.closeSubpath()
-        p.setPen(QPen(QColor(C.TEXT_MED), 1.3))
-        p.setBrush(QColor(255, 255, 255, 26))
+        fg = QLinearGradient(pg.topLeft(), pg.bottomLeft())
+        fg.setColorAt(0, QColor(255, 255, 255, 64))
+        fg.setColorAt(1, QColor(255, 255, 255, 16))
+        p.setPen(QPen(QColor(255, 255, 255, 120), 1.2))
+        p.setBrush(QBrush(fg))
         p.drawPath(path)
+        fold = QPolygonF([QPointF(pg.right() - 12, pg.top()), QPointF(pg.right() - 12, pg.top() + 12), QPointF(pg.right(), pg.top() + 12)])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 70))
+        p.drawPolygon(fold)
+        p.setBrush(QColor(255, 255, 255, 30))
+        for i in range(3):
+            p.drawRoundedRect(QRectF(pg.left() + 7, pg.top() + 18 + i * 6, 26 - i * 5, 2.2), 1.1, 1.1)
         ext = (d.get("_ext") or "").lstrip(".").upper()[:4] or "FILE"
-        p.setFont(_F(8, QFont.Weight.Bold))
-        p.setPen(QColor(C.PRI))
-        p.drawText(QRectF(pg.left(), pg.top() + 22, pg.width(), 20), _AL.AlignCenter, ext)
+        p.setFont(_F(8, QFont.Weight.Bold, spacing=0.6))
+        tw = QFontMetrics(p.font()).horizontalAdvance(ext) + 14
+        badge = QRectF(pg.left() - 8, pg.bottom() - 14, tw, 16)
+        bg = QLinearGradient(badge.topLeft(), badge.topRight())
+        bg.setColorAt(0, QColor(C.PRI))
+        bg.setColorAt(1, QColor(C.ACC))
+        p.setBrush(QBrush(bg))
+        p.drawRoundedRect(badge, 8, 8)
+        p.setPen(QColor(4, 14, 28))
+        p.drawText(badge, _AL.AlignCenter, ext)
         self._title(p, QRectF(inner.left(), inner.bottom() - 52, inner.width(), 26), d["title"], 11)
         p.setFont(_F(9))
         p.setPen(QColor(C.TEXT_DIM))
@@ -1126,51 +1278,82 @@ class HandSpaceOverlay(QWidget):
     def _open_file(self, p: QPainter, c: Card, rect: QRectF):
         d = c.data
         inner = rect.adjusted(34, 28, -34, -28)
-        self._title(p, QRectF(inner.left(), inner.top(), inner.width(), 44), d["title"], 18, C.PRI)
-        p.setPen(QPen(QColor(C.PRI), 1))
-        p.drawLine(QPointF(inner.left(), inner.top() + 50), QPointF(inner.left() + 50, inner.top() + 50))
-        rows = [("Type", (d.get("_ext") or "").lstrip(".").upper() or "File"), ("Size", human_size(d.get("_sz", 0))),
-                ("Modified", d.get("date", "")), ("Location", d.get("path", ""))]
-        p.setFont(_F(12))
+        self._chip(p, QRectF(inner.left(), inner.top() + 2, 40, 40), QColor(_accent_for(d)), _glyph_for(d), _emoji_for(d))
+        self._title(p, QRectF(inner.left() + 54, inner.top(), inner.width() - 54, 44), d["title"], 18, C.PRI)
+        ln = QLinearGradient(inner.left(), 0, inner.right(), 0)
+        ln.setColorAt(0, _q(C.PRI, 200))
+        ln.setColorAt(1, _q(C.PRI, 0))
+        p.setPen(QPen(QBrush(ln), 1.4))
+        p.drawLine(QPointF(inner.left(), inner.top() + 54), QPointF(inner.right(), inner.top() + 54))
+        rows = [("TYPE", (d.get("_ext") or "").lstrip(".").upper() or "File"), ("SIZE", human_size(d.get("_sz", 0))),
+                ("MODIFIED", d.get("date", "")), ("LOCATION", d.get("path", ""))]
         for i, (k, v) in enumerate(rows):
-            y = inner.top() + 66 + i * 34
+            y = inner.top() + 70 + i * 38
+            p.setFont(_F(9, QFont.Weight.DemiBold, spacing=1.2))
             p.setPen(QColor(C.TEXT_DIM))
-            p.drawText(QRectF(inner.left(), y, 100, 28), _AL.AlignLeft | _AL.AlignVCenter, k)
+            p.drawText(QRectF(inner.left(), y, 110, 30), _AL.AlignLeft | _AL.AlignVCenter, k)
+            p.setFont(_F(12))
             p.setPen(QColor(C.TEXT))
             fm = QFontMetrics(p.font())
-            p.drawText(QRectF(inner.left() + 100, y, inner.width() - 100, 28), _AL.AlignLeft | _AL.AlignVCenter,
-                       fm.elidedText(v, Qt.TextElideMode.ElideMiddle, int(inner.width() - 100)))
+            p.drawText(QRectF(inner.left() + 118, y, inner.width() - 118, 30), _AL.AlignLeft | _AL.AlignVCenter,
+                       fm.elidedText(v, Qt.TextElideMode.ElideMiddle, int(inner.width() - 118)))
+            p.setPen(QPen(QColor(255, 255, 255, 16), 1))
+            p.drawLine(QPointF(inner.left(), y + 34), QPointF(inner.right(), y + 34))
         from core.hand_space import can_launch
         if not can_launch(d):
             p.setFont(_F(10))
+            msg = "Programs and scripts are never started from a gesture."
+            wm = QFontMetrics(p.font()).horizontalAdvance(msg) + 42
+            pill = QRectF(inner.left(), inner.bottom() - 34, min(inner.width(), wm), 30)
+            p.setPen(QPen(_q(C.AMBER, 120), 1))
+            p.setBrush(_q(C.AMBER, 26))
+            p.drawRoundedRect(pill, 15, 15)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(C.AMBER))
+            p.drawEllipse(QPointF(pill.left() + 16, pill.center().y()), 3.2, 3.2)
             p.setPen(QColor(C.AMBER))
-            p.drawText(QRectF(inner.left(), inner.bottom() - 30, inner.width(), 26), _AL.AlignLeft | _AL.AlignVCenter,
-                       "Programs and scripts are never started from a gesture.")
+            p.drawText(QRectF(pill.left() + 28, pill.top(), pill.width() - 34, pill.height()), _AL.AlignLeft | _AL.AlignVCenter, msg)
 
     # notes
     def _card_map(self, p: QPainter, c: Card, rect: QRectF):
         d = c.data
         if c.k <= 0.5:                                                  # resting card: a little globe
-            inner = rect.adjusted(14, 10, -14, -10)
-            self._title(p, QRectF(inner.left(), inner.top(), inner.width(), 26), d["title"], 11, C.PRI)
-            p.setPen(QPen(QColor(C.PRI), 1))
-            p.drawLine(QPointF(inner.left(), inner.top() + 29), QPointF(inner.left() + 34, inner.top() + 29))
-            ctr = QPointF(rect.center().x(), rect.center().y() + 10)
-            r = min(rect.width(), rect.height()) * 0.25
-            p.setBrush(QColor(80, 170, 230, 55))
-            p.setPen(QPen(QColor(C.PRI), 1.6))
+            inner = rect.adjusted(16, 14, -16, -14)
+            self._chip(p, QRectF(inner.left(), inner.top(), 32, 32), QColor(C.PRI), "globe")
+            tx = inner.left() + 42
+            self._title(p, QRectF(tx, inner.top() - 1, inner.right() - tx, 18), d["title"], 11, "#ffffff")
+            p.setFont(_F(8))
+            p.setPen(QColor(C.TEXT_DIM))
+            p.drawText(QRectF(tx, inner.top() + 17, inner.right() - tx, 16), _AL.AlignLeft | _AL.AlignVCenter, "OpenStreetMap")
+            ctr = QPointF(rect.right() - 52, rect.bottom() - 46)                  # a little globe in the corner
+            r = 31.0
+            halo = QRadialGradient(ctr, r * 1.9)
+            halo.setColorAt(0, _q(C.PRI, 62))
+            halo.setColorAt(1, _q(C.PRI, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(halo))
+            p.drawEllipse(ctr, r * 1.9, r * 1.9)
+            sph = QRadialGradient(QPointF(ctr.x() - r * 0.35, ctr.y() - r * 0.4), r * 1.5)
+            sph.setColorAt(0, QColor(130, 220, 255, 200))
+            sph.setColorAt(0.6, QColor(34, 110, 190, 190))
+            sph.setColorAt(1, QColor(8, 30, 70, 220))
+            p.setBrush(QBrush(sph))
+            p.setPen(QPen(_q(C.PRI, 190), 1.3))
             p.drawEllipse(ctr, r, r)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor(C.PRI), 1.0))
-            p.drawEllipse(ctr, r * 0.45, r)
+            p.setPen(QPen(_q("#ffffff", 70), 0.9))
+            p.drawEllipse(ctr, r * 0.42, r)
+            p.drawEllipse(ctr, r * 0.8, r)
             p.drawLine(QPointF(ctr.x() - r, ctr.y()), QPointF(ctr.x() + r, ctr.y()))
             p.drawLine(QPointF(ctr.x(), ctr.y() - r), QPointF(ctr.x(), ctr.y() + r))
             for k in (-0.55, 0.55):
                 w = r * math.sqrt(1 - k * k)
                 p.drawLine(QPointF(ctr.x() - w, ctr.y() + k * r), QPointF(ctr.x() + w, ctr.y() + k * r))
+            opt = QTextOption(_AL.AlignLeft | _AL.AlignBottom)
+            opt.setWrapMode(QTextOption.WrapMode.WordWrap)
             p.setFont(_F(9))
-            p.setPen(QColor(C.TEXT_DIM))
-            p.drawText(QRectF(inner.left(), rect.bottom() - 34, inner.width(), 22), _AL.AlignCenter, d.get("sub", ""))
+            p.setPen(QColor(C.TEXT_MED))
+            p.drawText(QRectF(inner.left(), inner.bottom() - 52, inner.width() - 96, 52), d.get("sub", ""), opt)
             return
         fs = self._fs and c.open
         view = rect if fs else rect.adjusted(14, 14, -14, -14)
@@ -1181,7 +1364,7 @@ class HandSpaceOverlay(QWidget):
         p.save()
         if not fs:
             clip = QPainterPath()
-            clip.addRoundedRect(view, 12, 12)
+            clip.addRoundedRect(view, 14, 14)
             p.setClipPath(clip)
         else:
             p.setClipRect(view)
@@ -1244,6 +1427,10 @@ class HandSpaceOverlay(QWidget):
         p.setPen(QColor(50, 60, 70))
         p.drawText(box, _AL.AlignCenter, cr)
         p.restore()
+        if not fs:                                                       # a fine rim around the map window
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(_q("#ffffff", 70), 1.2))
+            p.drawRoundedRect(view.adjusted(0.6, 0.6, -0.6, -0.6), 14, 14)
         p.setPen(Qt.PenStyle.NoPen)
 
     def _card_text(self, p: QPainter, c: Card, rect: QRectF):
@@ -1251,9 +1438,14 @@ class HandSpaceOverlay(QWidget):
         mono = bool(d.get("mono"))
         if c.k > 0.5:
             inner = rect.adjusted(34, 26, -34, -26)
-            self._title(p, QRectF(inner.left(), inner.top(), inner.width(), 44), d["title"], 18, C.PRI)
-            p.setPen(QPen(QColor(C.PRI), 1))
-            p.drawLine(QPointF(inner.left(), inner.top() + 48), QPointF(inner.left() + 50, inner.top() + 48))
+            acc = QColor(_accent_for(d))
+            self._chip(p, QRectF(inner.left(), inner.top() + 2, 40, 40), acc, _glyph_for(d), _emoji_for(d))
+            self._title(p, QRectF(inner.left() + 54, inner.top(), inner.width() - 54, 44), d["title"], 18, "#ffffff")
+            ln = QLinearGradient(inner.left(), 0, inner.right(), 0)
+            ln.setColorAt(0, _q(acc, 210))
+            ln.setColorAt(1, _q(acc, 0))
+            p.setPen(QPen(QBrush(ln), 1.4))
+            p.drawLine(QPointF(inner.left(), inner.top() + 52), QPointF(inner.right(), inner.top() + 52))
             view = QRectF(inner.left(), inner.top() + 60, inner.width(), inner.height() - 60)
             f = QFont("Cascadia Mono" if mono else "Segoe UI", 11 if mono else 13)
             p.setFont(f)
@@ -1269,26 +1461,39 @@ class HandSpaceOverlay(QWidget):
             p.drawText(QRectF(view.left(), view.top() - c.scroll, view.width() - 14, full_h + 40), text, opt)
             p.restore()
             if full_h > view.height():                                    # scroll bar
-                tr = QRectF(view.right() - 5, view.top(), 4, view.height())
+                tr = QRectF(view.right() - 6, view.top(), 4, view.height())
                 p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(255, 255, 255, 30))
+                p.setBrush(QColor(255, 255, 255, 26))
                 p.drawRoundedRect(tr, 2, 2)
                 th = max(30.0, view.height() * view.height() / full_h)
                 ty = tr.top() + (tr.height() - th) * (c.scroll / max(1.0, full_h - view.height()))
-                p.setBrush(QColor(C.PRI))
+                tg = QLinearGradient(0, ty, 0, ty + th)
+                tg.setColorAt(0, QColor(C.PRI))
+                tg.setColorAt(1, QColor(C.ACC))
+                p.setBrush(QBrush(tg))
                 p.drawRoundedRect(QRectF(tr.left(), ty, 4, th), 2, 2)
             return
-        inner = rect.adjusted(14, 10, -14, -10)
-        self._title(p, QRectF(inner.left(), inner.top(), inner.width(), 26), d["title"], 11, C.PRI)
-        p.setPen(QPen(QColor(C.PRI), 1))
-        p.drawLine(QPointF(inner.left(), inner.top() + 29), QPointF(inner.left() + 34, inner.top() + 29))
+        inner = rect.adjusted(16, 14, -16, -14)                          # resting card: badge, title, subtitle, a peek of the text
+        acc = QColor(_accent_for(d))
+        self._chip(p, QRectF(inner.left(), inner.top(), 32, 32), acc, _glyph_for(d), _emoji_for(d))
+        tx = inner.left() + 42
+        self._title(p, QRectF(tx, inner.top() - 1, inner.right() - tx, 18), d["title"], 11, "#ffffff")
+        p.setFont(_F(8))
+        p.setPen(QColor(C.TEXT_DIM))
+        p.drawText(QRectF(tx, inner.top() + 17, inner.right() - tx, 16), _AL.AlignLeft | _AL.AlignVCenter,
+                   _elided(d.get("sub", ""), 8, int(inner.right() - tx)))
+        ln = QLinearGradient(inner.left(), 0, inner.right(), 0)
+        ln.setColorAt(0, _q(acc, 120))
+        ln.setColorAt(1, _q(acc, 0))
+        p.setPen(QPen(QBrush(ln), 1.0))
+        p.drawLine(QPointF(inner.left(), inner.top() + 42), QPointF(inner.right(), inner.top() + 42))
         p.setFont(QFont("Cascadia Mono" if mono else "Segoe UI", 8 if mono else 9))
-        p.setPen(QColor(C.TEXT))
+        p.setPen(QColor(C.TEXT_MED))
         opt = QTextOption()
         opt.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         p.save()
-        p.setClipRect(QRectF(inner.left(), inner.top() + 34, inner.width(), inner.height() - 34))
-        p.drawText(QRectF(inner.left(), inner.top() + 34, inner.width(), inner.height() - 34), d.get("text", "") or "(empty)", opt)
+        p.setClipRect(QRectF(inner.left(), inner.top() + 48, inner.width(), inner.height() - 48))
+        p.drawText(QRectF(inner.left(), inner.top() + 48, inner.width(), inner.height() - 48), d.get("text", "") or "(empty)", opt)
         p.restore()
 
     # pictures
@@ -1325,13 +1530,16 @@ class HandSpaceOverlay(QWidget):
                 sw, sh = tr.width() / k, tr.height() / k
                 p.drawPixmap(tr, px, QRectF((iw - sw) / 2, (ih - sh) / 2, sw, sh))
         if not fs:
-            strip = QLinearGradient(0, tr.bottom() - 46, 0, tr.bottom())
+            strip = QLinearGradient(0, tr.bottom() - 62, 0, tr.bottom())
             strip.setColorAt(0, QColor(0, 0, 0, 0))
-            strip.setColorAt(1, QColor(0, 0, 0, 190))
-            p.fillRect(QRectF(tr.left(), tr.bottom() - 46, tr.width(), 46), QBrush(strip))
+            strip.setColorAt(1, QColor(0, 4, 12, 215))
+            p.fillRect(QRectF(tr.left(), tr.bottom() - 62, tr.width(), 62), QBrush(strip))
         p.restore()
         if fs:
             return
+        p.setBrush(Qt.BrushStyle.NoBrush)                                  # a hairline rim so the picture sits in the glass
+        p.setPen(QPen(_q("#ffffff", 56), 1.0))
+        p.drawRoundedRect(tr.adjusted(0.5, 0.5, -0.5, -0.5), rad, rad)
         title = d["title"] if c.k < 0.5 else d["title"] + (f"   ·   {d['dims'][0]}×{d['dims'][1]}" if d.get("dims") else "")
         self._title(p, QRectF(rect.left() + 16, rect.bottom() - 34, rect.width() - 100, 26), title, 10 if c.k < 0.5 else 12, "#ffffff")
         if c.k > 0.5 and c.zoom > 1.01:
@@ -1346,12 +1554,19 @@ class HandSpaceOverlay(QWidget):
         fs = self._fs and c.open
         pad, rad = (0, 0) if fs else (4, 12)
         tr = rect.adjusted(pad, pad, -pad, -pad)
-        g = QLinearGradient(tr.topLeft(), tr.bottomLeft())
-        g.setColorAt(0, QColor(12, 30, 60, 255 if fs else 215))
-        g.setColorAt(1, QColor(3, 8, 20, 255 if fs else 235))
+        g = QLinearGradient(tr.topLeft(), tr.bottomRight())
+        g.setColorAt(0, QColor(30, 22, 72, 255 if fs else 225))
+        g.setColorAt(0.55, QColor(10, 20, 52, 255 if fs else 232))
+        g.setColorAt(1, QColor(3, 8, 20, 255 if fs else 240))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(g)
         p.drawRoundedRect(tr, rad, rad)
+        if not fs:                                                        # a faint spotlight behind the model
+            spot = QRadialGradient(QPointF(tr.center().x(), tr.center().y() - 14), tr.width() * 0.55)
+            spot.setColorAt(0, _q(C.ACC, 46))
+            spot.setColorAt(1, _q(C.ACC, 0))
+            p.setBrush(QBrush(spot))
+            p.drawRoundedRect(tr, rad, rad)
         opened = c.k > 0.3
         drawn = False
         state = "off"
@@ -1374,14 +1589,18 @@ class HandSpaceOverlay(QWidget):
                 p.drawPixmap(QRectF(area.center().x() - side / 2, area.center().y() - side / 2, side, side), px,
                              QRectF(0, 0, px.width(), px.height()))
                 p.restore()
-                p.setFont(_F(9, QFont.Weight.Bold))                      # small "3D" tag in the corner
-                p.setPen(QColor(C.ACC))
-                p.drawText(QRectF(tr.left() + 12, tr.top() + 8, 40, 16), _AL.AlignLeft | _AL.AlignVCenter, "3D")
+                tag = QRectF(tr.left() + 12, tr.top() + 12, 34, 20)                # small "3D" pill in the corner
+                p.setPen(QPen(_q(C.ACC, 150), 1))
+                p.setBrush(_q(C.ACC, 40))
+                p.drawRoundedRect(tag, 10, 10)
+                p.setFont(_F(8, QFont.Weight.Bold, spacing=0.8))
+                p.setPen(_mix(C.ACC, "#ffffff", 0.35))
+                p.drawText(tag, _AL.AlignCenter, "3D")
             else:
-                f = _F(26 if not opened else 40, QFont.Weight.Bold)
-                p.setFont(f)
-                p.setPen(QColor(C.ACC))
-                p.drawText(QRectF(tr.left(), tr.top() + 6, tr.width(), tr.height() - 70), _AL.AlignCenter, "3D")
+                self._chip(p, QRectF(tr.center().x() - 28, tr.center().y() - 52, 56, 56), QColor(C.ACC), "cube")
+                p.setFont(_F(10, QFont.Weight.Bold, spacing=1.6))
+                p.setPen(_mix(C.ACC, "#ffffff", 0.35))
+                p.drawText(QRectF(tr.left(), tr.center().y() + 10, tr.width(), 22), _AL.AlignCenter, "3D MODEL")
             if msg and (px is None or opened):
                 p.setFont(_F(9))
                 p.setPen(QColor(C.TEXT_DIM))
@@ -1389,10 +1608,13 @@ class HandSpaceOverlay(QWidget):
                            QFontMetrics(p.font()).elidedText(msg, Qt.TextElideMode.ElideRight, int(tr.width() - 24)))
         if fs:
             return
-        strip = QLinearGradient(0, tr.bottom() - 46, 0, tr.bottom())
+        strip = QLinearGradient(0, tr.bottom() - 62, 0, tr.bottom())
         strip.setColorAt(0, QColor(0, 0, 0, 0))
-        strip.setColorAt(1, QColor(0, 0, 0, 190))
-        p.fillRect(QRectF(tr.left(), tr.bottom() - 46, tr.width(), 46), QBrush(strip))
+        strip.setColorAt(1, QColor(0, 4, 12, 215))
+        p.fillRect(QRectF(tr.left() + 1, tr.bottom() - 62, tr.width() - 2, 61), QBrush(strip))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(_q("#ffffff", 56), 1.0))
+        p.drawRoundedRect(tr.adjusted(0.5, 0.5, -0.5, -0.5), rad, rad)
         tris = self._tris.get(path)
         title = d["title"] + (f"   ·   {tris:,} triangles" if opened and tris else "")
         self._title(p, QRectF(rect.left() + 16, rect.bottom() - 34, rect.width() - 100, 26), title, 10 if not opened else 12, "#ffffff")
@@ -1431,32 +1653,39 @@ class HandSpaceOverlay(QWidget):
                 if playing:
                     if not fs:                                       # full screen draws this bar itself, above the controls
                         bar = QRectF(tr.left() + 18, tr.bottom() - 58, tr.width() - 36, 5)
-                        p.setPen(Qt.PenStyle.NoPen)
-                        p.setBrush(QColor(255, 255, 255, 60))
-                        p.drawRoundedRect(bar, 2.5, 2.5)
-                        if dur > 0:
-                            p.setBrush(QColor(C.PRI))
-                            p.drawRoundedRect(QRectF(bar.left(), bar.top(), max(5.0, bar.width() * min(1.0, pos / dur)), 5), 2.5, 2.5)
-                        p.setFont(_F(9))
+                        self._scrub(p, bar, (pos / dur) if dur > 0 else 0.0)
+                        p.setFont(_F(9, QFont.Weight.DemiBold))
                         p.setPen(QColor(255, 255, 255, 230))
                         fm = lambda s: f"{int(s) // 60}:{int(s) % 60:02d}"         # noqa: E731
-                        p.drawText(QRectF(bar.left(), bar.top() - 22, bar.width(), 20), _AL.AlignRight | _AL.AlignVCenter,
+                        p.drawText(QRectF(bar.left(), bar.top() - 24, bar.width(), 20), _AL.AlignRight | _AL.AlignVCenter,
                                    f"{fm(pos)} / {fm(dur)}")
                     if c.paused:
-                        p.setBrush(QColor(0, 0, 0, 120))
-                        p.drawEllipse(tr.center(), 38, 38)
-                        p.setBrush(QColor(255, 255, 255, 235))
-                        cx, cy = tr.center().x(), tr.center().y()
-                        p.drawPolygon(QPolygonF([QPointF(cx - 11, cy - 18), QPointF(cx - 11, cy + 18), QPointF(cx + 19, cy)]))
+                        ctr = tr.center()
+                        p.setPen(QPen(QColor(255, 255, 255, 90), 1.4))
+                        p.setBrush(QColor(4, 10, 24, 150))
+                        p.drawEllipse(ctr, 40, 40)
+                        p.setPen(Qt.PenStyle.NoPen)
+                        p.setBrush(QColor(255, 255, 255, 240))
+                        cx, cy = ctr.x(), ctr.y()
+                        p.drawPolygon(QPolygonF([QPointF(cx - 10, cy - 17), QPointF(cx - 10, cy + 17), QPointF(cx + 19, cy)]))
                     self._anim = True
         if not playing:
             cx, cy = tr.center().x(), tr.center().y() - 12
-            p.setPen(QPen(QColor(C.PRI), 2))
-            p.setBrush(QColor(110, 231, 255, 36))
-            p.drawEllipse(QPointF(cx, cy), 28, 28)
+            halo = QRadialGradient(QPointF(cx, cy), 62)                      # a glowing play button
+            halo.setColorAt(0, _q(C.ACC2, 70))
+            halo.setColorAt(1, _q(C.ACC2, 0))
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(C.PRI))
-            p.drawPolygon(QPolygonF([QPointF(cx - 9, cy - 13), QPointF(cx - 9, cy + 13), QPointF(cx + 14, cy)]))
+            p.setBrush(QBrush(halo))
+            p.drawEllipse(QPointF(cx, cy), 62, 62)
+            pg = QLinearGradient(cx, cy - 30, cx, cy + 30)
+            pg.setColorAt(0, _q(C.ACC2, 120))
+            pg.setColorAt(1, _q(C.ACC, 70))
+            p.setPen(QPen(_q("#ffffff", 150), 1.6))
+            p.setBrush(QBrush(pg))
+            p.drawEllipse(QPointF(cx, cy), 29, 29)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 240))
+            p.drawPolygon(QPolygonF([QPointF(cx - 8, cy - 13), QPointF(cx - 8, cy + 13), QPointF(cx + 14, cy)]))
             msg = err and f"GPU video unavailable: {err}"[:120]
             if not msg and c.open and self._cv is None:
                 msg = "GPU video: " + self._gl_why()
@@ -1469,10 +1698,13 @@ class HandSpaceOverlay(QWidget):
                            msg + ("  ·  ⧉ opens it in your default player" if err or self._cv is None else ""))
         if fs:
             return
-        strip = QLinearGradient(0, tr.bottom() - 46, 0, tr.bottom())
+        strip = QLinearGradient(0, tr.bottom() - 62, 0, tr.bottom())
         strip.setColorAt(0, QColor(0, 0, 0, 0))
-        strip.setColorAt(1, QColor(0, 0, 0, 190))
-        p.fillRect(QRectF(tr.left(), tr.bottom() - 46, tr.width(), 46), QBrush(strip))
+        strip.setColorAt(1, QColor(0, 4, 12, 215))
+        p.fillRect(QRectF(tr.left() + 1, tr.bottom() - 62, tr.width() - 2, 61), QBrush(strip))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(_q("#ffffff", 56), 1.0))
+        p.drawRoundedRect(tr.adjusted(0.5, 0.5, -0.5, -0.5), rad, rad)
         self._title(p, QRectF(rect.left() + 16, rect.bottom() - 34, rect.width() - 100, 26), d["title"], 10 if c.k < 0.5 else 12, "#ffffff")
 
     # ── hands ────────────────────────────────────────────────────────────────────────
@@ -1495,31 +1727,314 @@ class HandSpaceOverlay(QWidget):
             for a, b in BONES:
                 path.moveTo(pts[a])
                 path.lineTo(pts[b])
-            c = QColor(col)
-            c.setAlpha(70)
-            p.setPen(QPen(c, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setPen(QPen(_q(col, 80), 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(path)
         mid = QPointF(h.dpos[0], h.dpos[1])
-        ring = QColor(col)
-        ring.setAlpha(230)
+        rad = 11.0 if h.pinching else 21.0
+        glow = QRadialGradient(mid, rad * 2.8)                  # a soft halo around the pointer
+        glow.setColorAt(0, _q(col, 96 if h.pinching else 58))
+        glow.setColorAt(1, _q(col, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(mid, rad * 2.8, rad * 2.8)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(ring, 2))
-        p.drawEllipse(mid, 10 if h.pinching else 20, 10 if h.pinching else 20)
+        p.setPen(QPen(_q(col, 60), 5.0))
+        p.drawEllipse(mid, rad, rad)
+        p.setPen(QPen(_q(col, 240), 2.0))
+        p.drawEllipse(mid, rad, rad)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_q("#ffffff", 235 if h.pinching else 190))
+        p.drawEllipse(mid, 3.6 if h.pinching else 2.6, 3.6 if h.pinching else 2.6)
         if h.claw:
-            p.drawEllipse(QPointF(*h.dpalm), 120, 120)
+            pc = QPointF(*h.dpalm)
+            rg = QRadialGradient(pc, 120)
+            rg.setColorAt(0, _q(col, 0))
+            rg.setColorAt(0.8, _q(col, 14))
+            rg.setColorAt(1, _q(col, 46))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(rg))
+            p.drawEllipse(pc, 120, 120)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(_q(col, 170), 1.6, Qt.PenStyle.DashLine))
+            p.drawEllipse(pc, 120, 120)
         if h.fist_prog > 0.05:                                 # fist held: a ring fills up, then "back"
-            pc = QPointF(*h.dpalm)
-            p.setPen(QPen(QColor(C.AMBER), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawArc(QRectF(pc.x() - 46, pc.y() - 46, 92, 92), 90 * 16, int(-360 * 16 * h.fist_prog))
-            p.setFont(_F(10, QFont.Weight.DemiBold))
-            p.setPen(QColor(C.AMBER))
-            p.drawText(QRectF(pc.x() - 50, pc.y() + 52, 100, 22), _AL.AlignCenter, "Back")
+            self._ring(p, QPointF(*h.dpalm), h.fist_prog, QColor(C.AMBER), "Back")
         if 0.05 < h.palm_prog < 1.0:                           # flat palm held still over a film: a ring fills up, then pause / play
-            pc = QPointF(*h.dpalm)
             op = self.space.opened
-            p.setPen(QPen(QColor(C.ACC), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawArc(QRectF(pc.x() - 46, pc.y() - 46, 92, 92), 90 * 16, int(-360 * 16 * h.palm_prog))
-            p.setFont(_F(10, QFont.Weight.DemiBold))
-            p.setPen(QColor(C.ACC))
-            p.drawText(QRectF(pc.x() - 50, pc.y() + 52, 100, 22), _AL.AlignCenter, "Play" if (op is not None and op.paused) else "Pause")
+            self._ring(p, QPointF(*h.dpalm), h.palm_prog, QColor(C.ACC), "Play" if (op is not None and op.paused) else "Pause")
+
+    # ── shared building blocks: glass, glow, chips, glyphs, scrubber, rings ───────────
+    @staticmethod
+    def _glass(p: QPainter, r: QRectF, rad: float, accent=None, hot: float = 0.0, dark: bool = False,
+               shadow: bool = False, tint=None):
+        """A frosted-glass plate: optional drop shadow, vertical fill, gradient rim that lights up with `hot`, top sheen."""
+        acc = QColor(accent if accent is not None else C.PRI)
+        p.setPen(Qt.PenStyle.NoPen)
+        if shadow:
+            for i, al in enumerate((28, 17, 9)):
+                g = 5 + i * 7
+                p.setBrush(QColor(0, 0, 0, al))
+                p.drawRoundedRect(r.adjusted(-g, -g + 10, g, g + 10), rad + g, rad + g)
+        top = QColor(32, 58, 104, 238 if dark else 132)
+        bot = QColor(9, 18, 40, 248 if dark else 116)
+        if tint is not None:
+            top, bot = _mix(top, tint, 0.40), _mix(bot, tint, 0.30)
+        if hot > 0.01:
+            top, bot = _mix(top, acc, 0.24 * hot), _mix(bot, acc, 0.16 * hot)
+        fill = QLinearGradient(r.topLeft(), r.bottomLeft())
+        fill.setColorAt(0, top)
+        fill.setColorAt(1, bot)
+        p.setBrush(QBrush(fill))
+        p.drawRoundedRect(r, rad, rad)
+        rim = QLinearGradient(r.topLeft(), r.bottomLeft())
+        rim.setColorAt(0, QColor(255, 255, 255, int(96 + 110 * hot)))
+        rim.setColorAt(0.5, QColor(255, 255, 255, int(26 + 30 * hot)))
+        rim.setColorAt(1, _q(acc, 70 + 140 * hot))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QBrush(rim), 1.2))
+        p.drawRoundedRect(r.adjusted(0.6, 0.6, -0.6, -0.6), rad - 0.6, rad - 0.6)
+        sheen = QPainterPath()
+        sheen.addRoundedRect(r.adjusted(2, 2, -2, -r.height() * 0.52), max(2.0, rad - 2), max(2.0, rad - 2))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 14))
+        p.drawPath(sheen)
+
+    @staticmethod
+    def _glow(p: QPainter, rect: QRectF, rad: float, col, a: float = 1.0, width: float = 1.6):
+        """A neon outline: two wide faint strokes under a crisp one."""
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for w, al in ((width + 9, 20), (width + 4.5, 44), (width, 215)):
+            p.setPen(QPen(_q(col, al * a), w))
+            p.drawRoundedRect(rect, rad, rad)
+
+    def _chip(self, p: QPainter, r: QRectF, accent, glyph: str, emoji: str = ""):
+        """A small rounded badge with a line icon, tinted with the card's accent."""
+        acc = QColor(accent)
+        g = QLinearGradient(r.topLeft(), r.bottomRight())
+        g.setColorAt(0, _q(acc, 84))
+        g.setColorAt(1, _q(acc, 20))
+        rad = r.width() * 0.3
+        p.setBrush(QBrush(g))
+        p.setPen(QPen(_q(acc, 140), 1.1))
+        p.drawRoundedRect(r, rad, rad)
+        if emoji:                                                          # the icon the user picked for this card
+            p.setFont(_emoji_font(max(10, int(r.width() * 0.48))))
+            p.setPen(QColor("#ffffff"))
+            p.drawText(r, _AL.AlignCenter, emoji)
+            return
+        pad = r.width() * 0.27
+        self._glyph(p, glyph, r.adjusted(pad, pad, -pad, -pad), _mix(acc, "#ffffff", 0.45), max(1.4, r.width() * 0.05))
+
+    @staticmethod
+    def _glyph(p: QPainter, kind: str, r: QRectF, col: QColor, wd: float = 1.7):
+        p.setPen(QPen(col, wd, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        x, y, w, h = r.x(), r.y(), r.width(), r.height()
+        cx, cy = r.center().x(), r.center().y()
+        L = lambda a, b, c, d: p.drawLine(QPointF(a, b), QPointF(c, d))       # noqa: E731
+        if kind == "folder":
+            path = QPainterPath()
+            path.moveTo(x, y + h * 0.34)
+            path.lineTo(x, y + h * 0.12)
+            path.lineTo(x + w * 0.38, y + h * 0.12)
+            path.lineTo(x + w * 0.52, y + h * 0.3)
+            p.drawPath(path)
+            p.drawRoundedRect(QRectF(x, y + h * 0.3, w, h * 0.64), 3, 3)
+        elif kind == "calendar":
+            p.drawRoundedRect(QRectF(x, y + h * 0.14, w, h * 0.82), 3, 3)
+            L(x, y + h * 0.42, x + w, y + h * 0.42)
+            L(x + w * 0.3, y, x + w * 0.3, y + h * 0.26)
+            L(x + w * 0.7, y, x + w * 0.7, y + h * 0.26)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            for dx in (-0.2, 0.2):
+                p.drawEllipse(QPointF(cx + w * dx, cy + h * 0.22), 1.3, 1.3)
+        elif kind == "mail":
+            p.drawRoundedRect(QRectF(x, y + h * 0.16, w, h * 0.68), 3, 3)
+            path = QPainterPath()
+            path.moveTo(x + 1.5, y + h * 0.26)
+            path.lineTo(cx, cy + h * 0.1)
+            path.lineTo(x + w - 1.5, y + h * 0.26)
+            p.drawPath(path)
+        elif kind == "wallet":
+            p.drawRoundedRect(QRectF(x, y + h * 0.18, w, h * 0.7), 3.5, 3.5)
+            L(x + w * 0.1, y + h * 0.18, x + w * 0.62, y + h * 0.04)
+            p.drawRoundedRect(QRectF(x + w * 0.6, cy - h * 0.04, w * 0.4, h * 0.3), 2.5, 2.5)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawEllipse(QPointF(x + w * 0.78, cy + h * 0.11), 1.3, 1.3)
+        elif kind == "globe":
+            p.drawEllipse(QPointF(cx, cy), w / 2, h / 2)
+            p.drawEllipse(QPointF(cx, cy), w * 0.2, h / 2)
+            L(x, cy, x + w, cy)
+        elif kind == "cube":
+            p.drawPolygon(QPolygonF([QPointF(cx, y), QPointF(x + w, y + h * 0.25), QPointF(x + w, y + h * 0.75),
+                                     QPointF(cx, y + h), QPointF(x, y + h * 0.75), QPointF(x, y + h * 0.25)]))
+            L(cx, cy, x, y + h * 0.25)
+            L(cx, cy, x + w, y + h * 0.25)
+            L(cx, cy, cx, y + h)
+        elif kind == "film":
+            p.drawRoundedRect(QRectF(x, y + h * 0.1, w, h * 0.8), 3, 3)
+            p.setBrush(col)
+            p.drawPolygon(QPolygonF([QPointF(cx - w * 0.12, cy - h * 0.2), QPointF(cx - w * 0.12, cy + h * 0.2), QPointF(cx + w * 0.2, cy)]))
+        elif kind == "image":
+            p.drawRoundedRect(QRectF(x, y + h * 0.1, w, h * 0.8), 3, 3)
+            path = QPainterPath()
+            path.moveTo(x + 2, y + h * 0.82)
+            path.lineTo(x + w * 0.38, cy)
+            path.lineTo(x + w * 0.58, cy + h * 0.2)
+            path.lineTo(x + w * 0.74, cy - h * 0.06)
+            path.lineTo(x + w - 2, y + h * 0.82)
+            p.drawPath(path)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawEllipse(QPointF(x + w * 0.28, y + h * 0.32), 1.6, 1.6)
+        elif kind == "code":
+            L(x + w * 0.3, y + h * 0.2, x, cy)
+            L(x, cy, x + w * 0.3, y + h * 0.8)
+            L(x + w * 0.7, y + h * 0.2, x + w, cy)
+            L(x + w, cy, x + w * 0.7, y + h * 0.8)
+            L(x + w * 0.58, y + h * 0.1, x + w * 0.42, y + h * 0.9)
+        else:                                                           # "doc"
+            path = QPainterPath()
+            path.moveTo(x + w * 0.12, y)
+            path.lineTo(x + w * 0.62, y)
+            path.lineTo(x + w * 0.88, y + h * 0.26)
+            path.lineTo(x + w * 0.88, y + h)
+            path.lineTo(x + w * 0.12, y + h)
+            path.closeSubpath()
+            p.drawPath(path)
+            L(x + w * 0.3, y + h * 0.5, x + w * 0.7, y + h * 0.5)
+            L(x + w * 0.3, y + h * 0.7, x + w * 0.6, y + h * 0.7)
+
+    @staticmethod
+    def _scrub(p: QPainter, bar: QRectF, frac: float):
+        """The video progress bar: glassy track, gradient fill and a glowing knob."""
+        frac = max(0.0, min(1.0, frac))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 54))
+        p.drawRoundedRect(bar, bar.height() / 2, bar.height() / 2)
+        fw = max(bar.height(), bar.width() * frac)
+        fill = QRectF(bar.left(), bar.top(), fw, bar.height())
+        g = QLinearGradient(fill.left(), 0, fill.right() + 1, 0)
+        g.setColorAt(0, QColor(C.PRI))
+        g.setColorAt(1, QColor(C.ACC))
+        p.setBrush(QBrush(g))
+        p.drawRoundedRect(fill, bar.height() / 2, bar.height() / 2)
+        kx, ky = fill.right(), bar.center().y()
+        p.setBrush(_q(C.PRI, 60))
+        p.drawEllipse(QPointF(kx, ky), bar.height() * 2.0, bar.height() * 2.0)
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(QPointF(kx, ky), bar.height() * 1.05, bar.height() * 1.05)
+
+    @staticmethod
+    def _ring(p: QPainter, pc: QPointF, prog: float, col: QColor, label: str):
+        """A hold-to-confirm ring around the palm, with a small caption beneath it."""
+        rect = QRectF(pc.x() - 46, pc.y() - 46, 92, 92)
+        p.setBrush(QColor(0, 6, 16, 110))
+        p.setPen(QPen(QColor(255, 255, 255, 36), 6))
+        p.drawEllipse(rect)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(_q(col, 70), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawArc(rect, 90 * 16, int(-360 * 16 * prog))
+        p.setPen(QPen(col, 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawArc(rect, 90 * 16, int(-360 * 16 * prog))
+        p.setFont(_F(10, QFont.Weight.DemiBold))
+        tw = QFontMetrics(p.font()).horizontalAdvance(label) + 24
+        cap = QRectF(pc.x() - tw / 2, pc.y() + 56, tw, 24)
+        p.setPen(QPen(_q(col, 130), 1))
+        p.setBrush(QColor(4, 12, 28, 215))
+        p.drawRoundedRect(cap, 12, 12)
+        p.setPen(col)
+        p.drawText(cap, _AL.AlignCenter, label)
+
+    def _draw_dock(self, p: QPainter):
+        """A frosted capsule behind the viewer's control buttons, so they read as one bar."""
+        bs = [b for b in self.space.buttons if not b.get("menu") and b["id"].startswith(("v_", "a_more"))]
+        if len(bs) < 2:
+            return
+        x0 = min(b["x"] for b in bs)
+        x1 = max(b["x"] + b["w"] for b in bs)
+        y0 = min(b["y"] for b in bs)
+        y1 = max(b["y"] + b["h"] for b in bs)
+        r = QRectF(x0 - 18, y0 - 12, x1 - x0 + 36, y1 - y0 + 24)
+        self._glass(p, r, min(32.0, r.height() / 2), C.PRI, 0.0, dark=True, shadow=True)
+
+    def _draw_pager(self, p: QPainter, W: int, H: int):
+        sp = self.space
+        r = QRectF(W / 2 - 66, H - 112 + 8, 132, 36)
+        self._glass(p, r, 18, C.PRI, 0.0, dark=True)
+        p.setFont(_F(11, QFont.Weight.DemiBold, spacing=0.5))
+        p.setPen(QColor(C.TEXT))
+        p.drawText(r, _AL.AlignCenter, f"{sp.page + 1}  /  {sp.pages}")
+
+    def _draw_hint(self, p: QPainter, W: int, H: int):
+        """The gesture cheat-sheet at the bottom: `Gesture  does this` pairs in a capsule, divided by dots."""
+        parts = [s.strip() for s in str(self.space.hint or "").split("·") if s.strip()] + ["Esc / ✕ to leave"]
+        fk, fv = _F(9, QFont.Weight.DemiBold), _F(9)
+        mk, mv = QFontMetrics(fk), QFontMetrics(fv)
+        items = []
+        for s in parts:
+            if "=" in s:
+                k, v = (t.strip() for t in s.split("=", 1))
+            else:
+                k, v = "", s
+            wk = mk.horizontalAdvance(k) if k else 0
+            wv = mv.horizontalAdvance(v)
+            items.append((k, v, wk, wv, wk + wv + (8 if k else 0)))
+        sep = 26
+        total = sum(it[4] for it in items) + sep * (len(items) - 1)
+        h = 32
+        y = H - 58
+        if total > W - 110:                                            # too long for one line: just elide it
+            p.setFont(fv)
+            p.setPen(QColor(C.TEXT_DIM))
+            p.drawText(QRectF(40, y, W - 80, h), _AL.AlignCenter,
+                       QFontMetrics(fv).elidedText("   ·   ".join(parts), Qt.TextElideMode.ElideRight, W - 100))
+            return
+        r = QRectF((W - total) / 2 - 24, y, total + 48, h)
+        self._glass(p, r, h / 2, C.PRI, 0.0, dark=True)
+        x = r.left() + 24
+        for i, (k, v, wk, wv, wt) in enumerate(items):
+            if k:
+                p.setFont(fk)
+                p.setPen(QColor(C.PRI))
+                p.drawText(QRectF(x, y, wk + 2, h), _AL.AlignLeft | _AL.AlignVCenter, k)
+            p.setFont(fv)
+            p.setPen(QColor(C.TEXT_MED))
+            p.drawText(QRectF(x + wk + (8 if k else 0), y, wv + 2, h), _AL.AlignLeft | _AL.AlignVCenter, v)
+            x += wt
+            if i < len(items) - 1:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(_q(C.TEXT_DIM, 190))
+                p.drawEllipse(QPointF(x + sep / 2, y + h / 2), 1.7, 1.7)
+                x += sep
+
+    def _draw_empty(self, p: QPainter, W: int, H: int):
+        r = QRectF(W / 2 - 46, H / 2 - 92, 92, 92)
+        self._glass(p, r, 46, C.PRI, 0.0, dark=True, shadow=True)
+        self._glyph(p, "folder", r.adjusted(27, 28, -27, -28), _q(C.PRI, 235), 2.2)
+        p.setFont(_F(17, QFont.Weight.DemiBold))
+        p.setPen(QColor(C.TEXT))
+        p.drawText(QRectF(0, H / 2 + 14, W, 32), _AL.AlignCenter, "This folder is empty")
+        p.setFont(_F(10))
+        p.setPen(QColor(C.TEXT_DIM))
+        p.drawText(QRectF(0, H / 2 + 46, W, 22), _AL.AlignCenter, "Nothing to show here yet")
+
+    def _draw_toast(self, p: QPainter, W: int, H: int, text: str):
+        p.setFont(_F(11, QFont.Weight.DemiBold))
+        tw = QFontMetrics(p.font()).horizontalAdvance(text) + 70
+        r = QRectF((W - tw) / 2, H - 178, tw, 42)
+        self._glass(p, r, 21, C.GREEN, 0.0, dark=True, shadow=True)
+        dot = QPointF(r.left() + 24, r.center().y())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_q(C.GREEN, 56))
+        p.drawEllipse(dot, 8, 8)
+        p.setBrush(QColor(C.GREEN))
+        p.drawEllipse(dot, 3.6, 3.6)
+        p.setPen(QColor(C.TEXT))
+        p.drawText(QRectF(r.left() + 40, r.top(), r.width() - 54, r.height()), _AL.AlignLeft | _AL.AlignVCenter, text)
+
+
+#by ASDcuber
