@@ -184,13 +184,20 @@ Optional settings in `config/api_keys.json`:
 
 ### 🏝 Dynamic Island
 
-A small black pill sits at the top of your screen all the time — like the iPhone's Dynamic Island.
+A floating glass player sits at the top of your screen — a little below the edge — and stays **above everything, Hand Space included**.
 
-* **Resting:** the time in the middle; the weather on the sides, or a spinning disc and equaliser while Spotify plays.
-* **Hover, click, or a new song:** it grows into a card with the big time, the date, the weather and the player (⏮ ⏯ ⏭). It shrinks back by itself.
-* **Right-click:** pin it open or hide it. Turn it off for good with `"dynamic_island": false` in the settings file.
+* **Resting:** a slim pill. The time in the middle; the cover and an equaliser while music plays, the weather otherwise.
+* **Hover, click, or a new song:** it opens into a player card tinted with the colour of the cover — cover, title, artist, album, a progress bar you can click to seek, and ⏮ ⏯ ⏭.
+* **⋮ button:** flips the card to the clock, date and weather page (with the next days). **♪ player** flips it back.
+* **Drag it** anywhere — the spot is remembered. **Right-click:** pin open, reset position, or hide. Off for good: `"dynamic_island": false`.
 
-It never takes focus and stays above other windows. Weather and music use the same sources and settings as the [live cards](#live-cards).
+It works with **any player** on Windows (Spotify, YouTube in Chrome, VLC…) once you install the optional package below. Without it, it falls back to Spotify's window title: title and artist only, no cover or progress.
+
+```bash
+pip install winsdk
+```
+
+Weather and music use the same sources and settings as the [live cards](#live-cards).
 
 ### Hand outline
 

@@ -1609,6 +1609,9 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_space_scene_paused", False):
             self._freeze_animations(True)      # Jarvis' animations stop while Hand Space is open
         ov.show_overlay(pinned)
+        isl = self._modules.get("island")
+        if isl is not None:
+            isl.lift()                         # the Dynamic Island stays above Hand Space
         self.write_log("SYS: Hand Space open — your drives are floating: pinch-tap a folder to go in, a picture to enlarge it, hold a fist to go back. Esc to leave.")
 
     def _on_space_closed(self):
