@@ -13,8 +13,13 @@ Safety:
 """
 from __future__ import annotations
 
+import collections
+import json
 import os
 import re
+import sys
+import time
+from urllib.parse import quote
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
@@ -240,6 +245,236 @@ def scan_receipt(path: str, fin=None) -> str:
     return clean(res, 220) or "Done."
 
 
+# ── structure for the rich cards: the plain text above, read back into data the Hand Space overlay can draw ──────────────
+def parse_calendar(text: str):
+    """calendar_text() → [{"label", "date", "events": [{"allday", "start", "end", "title", "loc"}]}]  (None if it is not an agenda)."""
+    days, cur = [], None
+    for line in str(text or "").split("\n"):
+        m = re.match(r"^(\S.*?)\s{2}·\s{2}(.+)$", line)
+        if m and not line.startswith(" "):
+            cur = {"label": m.group(1), "date": m.group(2), "events": []}
+            days.append(cur)
+            continue
+        if cur is None or not line.startswith("   "):
+            continue
+        body = line.strip()
+        if body.startswith("—"):                                   # "— nothing planned —"
+            continue
+        m = re.match(r"^(\d{2}:\d{2}) – (\d{2}:\d{2})\s{3}(.*)$", body) or re.match(r"^(All day)()\s{3}(.*)$", body)
+        if not m:
+            continue
+        title, _, loc = m.group(3).partition("   @ ")
+        cur["events"].append({"allday": m.group(1) == "All day", "start": "" if m.group(1) == "All day" else m.group(1),
+                              "end": m.group(2), "title": title.strip(), "loc": loc.strip()})
+    return days or None
+
+
+def parse_mail(text: str):
+    """mail_list() → {"count", "unread", "items": [{"n", "unread", "sender", "subject", "when", "snippet"}]}  (None for anything else)."""
+    items = []
+    for line in str(text or "").split("\n"):
+        m = re.match(r"^(\d+)\.\s{2}([●○])\s{2}(.*?)\s{2}—\s{2}(.*?)(?:\s{6}(\d{2} \w{3} \d{2}:\d{2}))?$", line)
+        if m:
+            items.append({"n": int(m.group(1)), "unread": m.group(2) == "●", "sender": m.group(3), "subject": m.group(4),
+                          "when": m.group(5) or "", "snippet": ""})
+        elif items and line.startswith("        ") and line.strip():
+            items[-1]["snippet"] = line.strip()
+    if not items:
+        return {"count": 0, "unread": 0, "items": []} if "inbox is empty" in str(text or "").lower() else None
+    return {"count": len(items), "unread": sum(1 for i in items if i["unread"]), "items": items}
+
+
+def parse_expenses(text: str):
+    """expenses_text() → month, totals, categories (with budgets) and the latest entries  (None if it is an error message)."""
+    text = str(text or "")
+    lines = text.split("\n")
+    m, at = None, 0
+    for at, ln in enumerate(lines[:4]):
+        m = re.match(r"^Spent\s+(.+?)\s{3,}Income\s+(.+?)\s{3,}Balance\s+(.+)$", ln)
+        if m:
+            break
+    if not m:
+        return None
+    out = {"month": lines[0].strip(), "spent": m.group(1).strip(), "income": m.group(2).strip(), "balance": m.group(3).strip(),
+           "cats": [], "latest": [], "empty": "Nothing recorded this month" in text}
+    sect = ""
+    for ln in lines[at + 1:]:
+        if ln.strip() == "By category":
+            sect = "cat"
+        elif ln.strip() == "Latest":
+            sect = "latest"
+        elif sect == "cat":
+            c = re.match(r"^(.+?)\s+([█░]{12})\s{2}(.+?)\s\((\d+)%\)(?:\s{5}budget (.+?) — (OVER by .+|\d+% used))?$", ln)
+            if c:
+                out["cats"].append({"name": c.group(1).strip(), "amount": c.group(3).strip(), "share": int(c.group(4)),
+                                    "budget": c.group(5), "status": c.group(6), "over": bool(c.group(6) and c.group(6).startswith("OVER"))})
+        elif sect == "latest" and ln.strip():
+            parts = ln.split("   ", 3)
+            if len(parts) >= 3 and re.match(r"^\d{2}-\d{2}$", parts[0].strip()):
+                note = parts[3].strip() if len(parts) > 3 else ""
+                out["latest"].append({"date": parts[0].strip(), "income": parts[1].strip().startswith("+"), "amount": parts[1].strip()[1:],
+                                      "cat": parts[2].strip(), "note": note.replace("🧾", "").strip(), "receipt": "🧾" in note})
+    return out
+
+
+def parse_json(text: str):
+    try:
+        d = json.loads(text)
+        return d if isinstance(d, dict) else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ── live widgets: weather, what is playing, this computer ────────────────────────────────────────────────────────────
+_GEO: dict[str, tuple] = {}
+
+
+def _cfg() -> dict:
+    try:
+        from actions._common import cfg
+        return cfg() or {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _http_json(url: str, timeout: float = 8.0):
+    import requests
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Jarvis-HandSpace"})
+    r.raise_for_status()
+    return r.json()
+
+
+def _where(city: str):
+    """(lat, lon, label): the city named in the config (`hs_weather_city`), else the rough place of this connection."""
+    key = city.strip().lower()
+    if key in _GEO:
+        return _GEO[key]
+    if key:
+        res = (_http_json("https://geocoding-api.open-meteo.com/v1/search?count=1&name=" + quote(city)).get("results") or [None])[0]
+        if not res:
+            raise LookupError(city)
+        out = (float(res["latitude"]), float(res["longitude"]), clean(res.get("name"), 40))
+    else:
+        d = _http_json("https://ipapi.co/json/")
+        out = (float(d["latitude"]), float(d["longitude"]), clean(d.get("city") or d.get("region"), 40) or "Here")
+    _GEO[key] = out
+    return out
+
+
+def wx_kind(code, is_day: bool = True) -> tuple[str, str]:
+    """WMO weather code → (words, icon name)."""
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return "Weather", "cloud"
+    if c == 0:
+        return "Clear", "clear" if is_day else "night"
+    if c in (1, 2):
+        return "Partly cloudy", "partly" if is_day else "cloud"
+    if c == 3:
+        return "Overcast", "cloud"
+    if c in (45, 48):
+        return "Fog", "fog"
+    if 51 <= c <= 57:
+        return "Drizzle", "rain"
+    if 61 <= c <= 67 or 80 <= c <= 82:
+        return "Rain", "rain"
+    if 71 <= c <= 77 or c in (85, 86):
+        return "Snow", "snow"
+    if c >= 95:
+        return "Thunderstorm", "storm"
+    return "Cloudy", "cloud"
+
+
+def weather_json(cfg: dict | None = None) -> str:
+    """Current weather and a 5-day outlook from Open-Meteo (free, no key) as JSON text. City: `hs_weather_city` in config, else
+    the rough location of this connection. Units: `hs_weather_units` = "f" for °F / mph (default °C / km/h)."""
+    cfg = cfg if cfg is not None else _cfg()
+    city = str(cfg.get("hs_weather_city") or cfg.get("weather_city") or cfg.get("city") or "")
+    fahr = str(cfg.get("hs_weather_units") or "").lower().startswith("f")
+    try:
+        lat, lon, label = _where(city)
+        url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat:.4f}&longitude={lon:.4f}"
+               "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day"
+               "&daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=5&timezone=auto"
+               + ("&temperature_unit=fahrenheit&wind_speed_unit=mph" if fahr else ""))
+        d = _http_json(url)
+        cur, day = d["current"], d["daily"]
+        days = [{"d": day["time"][i], "code": day["weather_code"][i], "hi": round(day["temperature_2m_max"][i]),
+                 "lo": round(day["temperature_2m_min"][i])} for i in range(min(5, len(day["time"])))]
+        return json.dumps({"city": label, "t": round(cur["temperature_2m"]), "feels": round(cur["apparent_temperature"]),
+                           "hum": round(cur["relative_humidity_2m"]), "wind": round(cur["wind_speed_10m"]), "code": cur["weather_code"],
+                           "day": bool(cur.get("is_day", 1)), "unit": "°F" if fahr else "°C", "wunit": "mph" if fahr else "km/h", "days": days})
+    except Exception:                                            # noqa: BLE001
+        hint = "" if city else ' Set "hs_weather_city" in config/api_keys.json.'
+        return json.dumps({"error": "I couldn't read the weather just now." + hint})
+
+
+def nowplaying_json() -> str:
+    """What Spotify is playing, as JSON text: {"state": "playing" | "paused" | "none", "title", "artist"}."""
+    state, title, artist = "none", "", ""
+    try:
+        from actions import spotify_controller as sc
+        if sys.platform == "win32":
+            t = clean(sc._win_title(), 140)                       # Spotify's window title is "Artist - Title" while it plays
+            if t:
+                artist, sep, title = t.partition(" - ")
+                if not sep:
+                    title, artist = t, ""
+                state = "playing"
+        else:
+            m = re.match(r"^(Playing|Paused on): (.*) by (.*)\.$", sc._now_playing())
+            if m:
+                state, title, artist = ("playing" if m.group(1) == "Playing" else "paused"), clean(m.group(2), 100), clean(m.group(3), 100)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return json.dumps({"state": state, "title": title.strip(), "artist": artist.strip()})
+
+
+class SysSampler:
+    """CPU / memory / disk / battery / network readings for the System card — cheap, so the window's thread asks once a second."""
+
+    def __init__(self):
+        self.cpu_hist = collections.deque(maxlen=60)
+        self.mem_hist = collections.deque(maxlen=60)
+        self.cur: dict = {}
+        self._t = 0.0
+        self._net = None
+
+    def sample(self, now: float | None = None) -> dict:
+        now = now if now is not None else time.time()
+        if self.cur and now - self._t < 1.0:
+            return self.cur
+        try:
+            import psutil
+        except ImportError:
+            self._t, self.cur = now, {"error": "psutil isn't installed."}
+            return self.cur
+        try:
+            vm = psutil.virtual_memory()
+            du = psutil.disk_usage(os.path.abspath(os.sep))
+            cur = {"cpu": float(psutil.cpu_percent(None)), "mem": float(vm.percent), "mem_used": vm.used, "mem_total": vm.total,
+                   "disk": float(du.percent), "disk_free": du.free, "disk_total": du.total, "up": 0.0, "down": 0.0,
+                   "boot": float(psutil.boot_time()), "bat": None, "plugged": None}
+            try:
+                b = psutil.sensors_battery()
+                if b is not None:
+                    cur["bat"], cur["plugged"] = float(b.percent), bool(b.power_plugged)
+            except Exception:                                    # noqa: BLE001
+                pass
+            n = psutil.net_io_counters()
+            if self._net is not None and now > self._net[0]:
+                dt = now - self._net[0]
+                cur["up"], cur["down"] = max(0.0, (n.bytes_sent - self._net[1]) / dt), max(0.0, (n.bytes_recv - self._net[2]) / dt)
+            self._net = (now, n.bytes_sent, n.bytes_recv)
+            self.cpu_hist.append(cur["cpu"])
+            self.mem_hist.append(cur["mem"])
+        except Exception:                                        # noqa: BLE001
+            cur = {"error": "Couldn't read the system just now."}
+        self._t, self.cur = now, cur
+        return cur
+
+
 # ── one entry point for the window's worker thread ───────────────────────────
 def handle(req: tuple, gw=None, fin=None):
     """req → (what, payload):  ("feed", {"feed", "text", "ids"}) | ("toast", str) | ("geocode", dict | str)."""
@@ -253,9 +488,15 @@ def handle(req: tuple, gw=None, fin=None):
             return "feed", {"feed": "mail", "text": text, "ids": ids}
         if which == "expenses":
             return "feed", {"feed": "expenses", "text": expenses_text(fin=fin), "ids": None}
+        if which == "weather":
+            return "feed", {"feed": "weather", "text": weather_json(), "ids": None}
+        if which == "nowplaying":
+            return "feed", {"feed": "nowplaying", "text": nowplaying_json(), "ids": None}
     if kind == "mail_read":
         return "feed", {"feed": "mail", "text": mail_body(req[1], gw), "ids": None, "keep_ids": True}
     if kind == "receipt":
         msg = scan_receipt(req[1], fin)
         return "receipt", {"msg": msg, "text": expenses_text(fin=fin)}
     return "toast", "Not something I can do."
+
+#by ASDcuber

@@ -160,6 +160,16 @@ def virtual_entries() -> list[dict]:
          "_feed": "mail", "_filled": True, "_ext": ".feed", "mono": False},
         {**base, "kind": "text", "title": "Expenses", "sub": "This month", "text": "Spending by category — drop a receipt here",
          "full": "Loading…", "_feed": "expenses", "_filled": True, "_ext": ".feed", "mono": False},
+        # live widgets: the weather and what Spotify plays are fetched in a worker thread; the clock and the system card are read
+        # by the window itself every frame
+        {**base, "kind": "text", "title": "Weather", "sub": "Right now", "text": "Live forecast", "full": "Loading…",
+         "_feed": "weather", "_filled": True, "_ext": ".feed", "mono": False},
+        {**base, "kind": "text", "title": "Now Playing", "sub": "Spotify", "text": "What is playing", "full": "Loading…",
+         "_feed": "nowplaying", "_filled": True, "_ext": ".feed", "mono": False},
+        {**base, "kind": "text", "title": "System", "sub": "Live", "text": "CPU · memory · disk", "full": "",
+         "_widget": "system", "_filled": True, "_ext": ".feed", "mono": False},
+        {**base, "kind": "text", "title": "Clock", "sub": "Local time", "text": "Time and date", "full": "",
+         "_widget": "clock", "_filled": True, "_ext": ".feed", "mono": False},
     ]
 
 
@@ -1897,7 +1907,7 @@ class Space:
         """Results of the background jobs (called from the window's thread): a card's content, a found place, a scanned receipt."""
         if what == "feed" and isinstance(payload, dict):
             f = payload.get("feed")
-            if f not in ("calendar", "mail", "expenses"):
+            if f not in ("calendar", "mail", "expenses", "weather", "nowplaying"):
                 return
             text = str(payload.get("text") or "")[:12000]
             self.feed_text[f] = text
@@ -1906,10 +1916,11 @@ class Space:
             for e in self.entries:
                 if e.get("_feed") == f:
                     e["full"] = text
-            for c in self.cards:
-                if c.data.get("_feed") == f:
-                    c.scroll = 0.0
-            self.version += 1
+            if f in ("calendar", "mail", "expenses"):                  # a live widget refreshes quietly: no scroll reset, no re-layout
+                for c in self.cards:
+                    if c.data.get("_feed") == f:
+                        c.scroll = 0.0
+                self.version += 1
         elif what == "geocode":
             if isinstance(payload, dict):
                 bb = payload.get("bbox")

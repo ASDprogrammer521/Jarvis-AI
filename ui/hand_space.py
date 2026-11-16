@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import QWidget
 from core.hand_space import Card, Space, human_size
 from core import map_service, space_feeds
 from core.space_map import TILE as MAP_TILE, ancestor as map_ancestor
-from ui import hs_gpu, mesh_thumb
+from ui import hs_gpu, hs_widgets, mesh_thumb
 from ui.fx import GL_ENABLED, samples_for
 from ui.hand_overlay import BONES
 from ui.mesh_formats import HEAVY_EXT
@@ -77,7 +77,11 @@ def _accent_for(d: dict) -> str:
     if kind == "text":
         if d.get("accent"):                                       # a card the user designed keeps its own colour
             return d["accent"]
-        return {"Calendar": C.PRI, "Mail": C.AMBER, "Expenses": C.GREEN}.get(d.get("title"), C.ACC)
+        key = d.get("_feed") or d.get("_widget")
+        if key:
+            return {"calendar": C.PRI, "mail": C.AMBER, "expenses": C.GREEN, "weather": "#5cc8ff", "nowplaying": C.GREEN,
+                    "system": C.ACC, "clock": C.ACC2}.get(key, C.ACC)
+        return C.ACC
     return {"drive": C.PRI, "folder": C.AMBER, "image": C.PRI, "model": C.ACC, "video": C.ACC2, "map": C.PRI}.get(kind, C.TEXT_MED)
 
 
@@ -98,7 +102,11 @@ def _emoji_font(px: int) -> QFont:
 def _glyph_for(d: dict) -> str:
     kind = d.get("kind", "file")
     if kind == "text":
-        return {"Calendar": "calendar", "Mail": "mail", "Expenses": "wallet"}.get(d.get("title"), "code" if d.get("mono") else "doc")
+        key = d.get("_feed") or d.get("_widget")
+        if key:
+            return {"calendar": "calendar", "mail": "mail", "expenses": "wallet", "weather": "cloud", "nowplaying": "music",
+                    "system": "chip", "clock": "clock"}.get(key, "doc")
+        return "code" if d.get("mono") else "doc"
     return {"folder": "folder", "image": "image", "model": "cube", "video": "film", "map": "globe"}.get(kind, "doc")
 
 
@@ -192,6 +200,9 @@ class HandSpaceOverlay(QWidget):
         self._mthumb_failed: set[str] = set()
         self._npool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hs-net")      # calendar / mail / expenses / place search
         self._njobs: list[Future] = []
+        self.sys = space_feeds.SysSampler()                          # CPU / RAM readings for the System card
+        self._wlast: dict[str, float] = {}                           # live widget → when its data was last asked for
+        self._wanim = 0.0
         self._tiles = None                                           # map_service.TileStore, created when the map is first opened
         self._geo = None
         self._tilepx: OrderedDict = OrderedDict()                    # (z, x, y) → QPixmap (one GPU texture each)
@@ -369,6 +380,7 @@ class HandSpaceOverlay(QWidget):
         self._poll_images()
         self._poll_models()
         sp = self.space
+        self._poll_widgets(now)
         op = sp.opened
         if op is not None and op.cmds:                       # buttons / drags aimed at the video player
             cmds, op.cmds = op.cmds, []
@@ -393,6 +405,30 @@ class HandSpaceOverlay(QWidget):
             self._t.setInterval(want)
         if busy:                                   # an idle screen (nothing moving, nobody there) is not repainted at all
             self.update()
+
+    # ── live widget cards ────────────────────────────────────────────────────────────
+    _WIDGET_EVERY = {"weather": 600.0, "nowplaying": 4.0, "calendar": 300.0, "mail": 300.0, "expenses": 120.0}
+
+    def sysdata(self) -> dict:
+        return self.sys.sample()
+
+    def _poll_widgets(self, now: float):
+        """Keep the live cards alive: ask for fresh data when it is due and keep repainting the moving ones."""
+        sp = self.space
+        kinds = {c.data.get("_feed") or c.data.get("_widget") for c in sp.cards if c.data.get("_feed") or c.data.get("_widget")}
+        if not kinds:
+            return
+        for k, every in self._WIDGET_EVERY.items():
+            reading = k == "mail" and sp.opened is not None and sp.opened.data.get("_feed") == "mail"       # don't swap a message being read
+            if k in kinds and not reading and now - self._wlast.get(k, 0.0) >= every and not any(r[:2] == ("feed", k) for r in sp.requests):
+                self._wlast[k] = now
+                sp._feed_t[k] = now
+                sp.requests.append(("feed", k))
+        due = 0.04 if ("nowplaying" in kinds or "weather" in kinds or "clock" in kinds) else 0.5      # equaliser / spinning disc / sweep hand
+        if "system" in kinds or "clock" in kinds or "nowplaying" in kinds or "weather" in kinds:
+            if now - self._wanim >= due:
+                self._wanim = now
+                self._anim = True
 
     def _gpu_stop_video(self):
         cv = self._cv
@@ -1447,6 +1483,9 @@ class HandSpaceOverlay(QWidget):
             p.setPen(QPen(QBrush(ln), 1.4))
             p.drawLine(QPointF(inner.left(), inner.top() + 52), QPointF(inner.right(), inner.top() + 52))
             view = QRectF(inner.left(), inner.top() + 60, inner.width(), inner.height() - 60)
+            live = d.get("_feed") or d.get("_widget")
+            if live and hs_widgets.paint(self, p, c, live, view, True):          # a rich or live card draws its own body
+                return
             f = QFont("Cascadia Mono" if mono else "Segoe UI", 11 if mono else 13)
             p.setFont(f)
             p.setPen(QColor(C.TEXT))
@@ -1487,6 +1526,9 @@ class HandSpaceOverlay(QWidget):
         ln.setColorAt(1, _q(acc, 0))
         p.setPen(QPen(QBrush(ln), 1.0))
         p.drawLine(QPointF(inner.left(), inner.top() + 42), QPointF(inner.right(), inner.top() + 42))
+        live = d.get("_feed") or d.get("_widget")
+        if live and hs_widgets.paint(self, p, c, live, QRectF(inner.left(), inner.top() + 50, inner.width(), inner.height() - 50), False):
+            return
         p.setFont(QFont("Cascadia Mono" if mono else "Segoe UI", 8 if mono else 9))
         p.setPen(QColor(C.TEXT_MED))
         opt = QTextOption()
@@ -1890,6 +1932,31 @@ class HandSpaceOverlay(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(col)
             p.drawEllipse(QPointF(x + w * 0.28, y + h * 0.32), 1.6, 1.6)
+        elif kind == "cloud":
+            path = QPainterPath()
+            path.moveTo(x + w * 0.2, y + h * 0.8)
+            path.cubicTo(x - w * 0.12, y + h * 0.8, x - w * 0.05, y + h * 0.38, x + w * 0.28, y + h * 0.42)
+            path.cubicTo(x + w * 0.3, y + h * 0.02, x + w * 0.88, y + h * 0.06, x + w * 0.8, y + h * 0.48)
+            path.cubicTo(x + w * 1.1, y + h * 0.5, x + w * 1.06, y + h * 0.8, x + w * 0.8, y + h * 0.8)
+            path.closeSubpath()
+            p.drawPath(path)
+        elif kind == "music":
+            L(x + w * 0.38, y + h * 0.14, x + w * 0.38, y + h * 0.76)
+            L(x + w * 0.38, y + h * 0.14, x + w * 0.9, y + h * 0.04)
+            L(x + w * 0.9, y + h * 0.04, x + w * 0.9, y + h * 0.62)
+            p.drawEllipse(QPointF(x + w * 0.24, y + h * 0.78), w * 0.16, w * 0.13)
+            p.drawEllipse(QPointF(x + w * 0.76, y + h * 0.64), w * 0.16, w * 0.13)
+        elif kind == "chip":
+            p.drawRoundedRect(QRectF(x + w * 0.2, y + h * 0.2, w * 0.6, h * 0.6), 2.5, 2.5)
+            for t in (0.36, 0.64):
+                L(x + w * t, y, x + w * t, y + h * 0.2)
+                L(x + w * t, y + h * 0.8, x + w * t, y + h)
+                L(x, y + h * t, x + w * 0.2, y + h * t)
+                L(x + w * 0.8, y + h * t, x + w, y + h * t)
+        elif kind == "clock":
+            p.drawEllipse(QPointF(cx, cy), w / 2, h / 2)
+            L(cx, cy, cx, y + h * 0.24)
+            L(cx, cy, x + w * 0.74, cy + h * 0.14)
         elif kind == "code":
             L(x + w * 0.3, y + h * 0.2, x, cy)
             L(x, cy, x + w * 0.3, y + h * 0.8)
