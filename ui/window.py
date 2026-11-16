@@ -631,6 +631,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(250, self._boot)
         QTimer.singleShot(2500, self._check_gpu)
         QTimer.singleShot(9000, self._auto_update_check)
+        QTimer.singleShot(3500, self._start_island)
 
     def _boot(self):
         try:
@@ -1579,6 +1580,18 @@ class MainWindow(QMainWindow):
                     pass
             self._frozen_timers = []
             self._pause_scene(False)
+
+    def _start_island(self):
+        """The Dynamic Island: a small pill at the top of the screen with the time, the weather and Spotify."""
+        if not read_cfg().get("dynamic_island", True) or self._modules.get("island") is not None:
+            return
+        try:
+            from ui.dynamic_island import DynamicIsland
+            isl = DynamicIsland()
+            self._modules["island"] = isl
+            isl.start()
+        except Exception as e:                                           # noqa: BLE001 - a decoration must never stop Jarvis
+            self.write_log(f"SYS: Dynamic Island could not start ({e}).")
 
     def _open_hand_space(self):
         ov = self._modules.get("hand_space")
@@ -2658,6 +2671,8 @@ class MainWindow(QMainWindow):
             self.camera.stop()
         self._close_media_user()
         self._mpv_close()
+        if self._modules.get("island") is not None:
+            self._modules["island"].stop()
         if self._compact is not None:
             self._compact.close()
         super().closeEvent(e)

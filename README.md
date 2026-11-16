@@ -182,6 +182,16 @@ Optional settings in `config/api_keys.json`:
 > [!NOTE]
 > **Weather uses the network.** Data comes from [Open-Meteo](https://open-meteo.com/) (free, no key). Without `hs_weather_city` it finds your rough location from your IP address through ipapi.co — set the city if you would rather not. Use `"hs_weather_units": "f"` for °F / mph. **Now Playing** reads Spotify's window title on Windows, so it shows the song only while Spotify is running.
 
+### 🏝 Dynamic Island
+
+A small black pill sits at the top of your screen all the time — like the iPhone's Dynamic Island.
+
+* **Resting:** the time in the middle; the weather on the sides, or a spinning disc and equaliser while Spotify plays.
+* **Hover, click, or a new song:** it grows into a card with the big time, the date, the weather and the player (⏮ ⏯ ⏭). It shrinks back by itself.
+* **Right-click:** pin it open or hide it. Turn it off for good with `"dynamic_island": false` in the settings file.
+
+It never takes focus and stays above other windows. Weather and music use the same sources and settings as the [live cards](#live-cards).
+
 ### Hand outline
 
 The **Show hand outline** switch on the Hand Space page draws the thin bones of your hand. Off = only the fingertip and pinch rings. Hand Space draws on the graphics card when GPU acceleration is on and falls back to the standard renderer on its own if needed (Settings → Appearance → Performance).
