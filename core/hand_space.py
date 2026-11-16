@@ -149,7 +149,7 @@ def _drive_entry(root: str, title: str) -> dict:
 
 
 def virtual_entries() -> list[dict]:
-    """The Map, Calendar, Mail and Expenses cards that sit beside the drives. They are not files (path ""): `_virtual` keeps
+    """The Map, Calendar, Mail, Expenses and Weather cards that sit beside the drives. They are not files (path ""): `_virtual` keeps
     every file action away from them, and `.feed` / `.map` are never launched. Their content is fetched only when opened."""
     base = {"image": None, "_dir": False, "_mt": 0.0, "_sz": 0, "_virtual": True, "path": "", "pinned": False}
     return [
@@ -160,16 +160,10 @@ def virtual_entries() -> list[dict]:
          "_feed": "mail", "_filled": True, "_ext": ".feed", "mono": False},
         {**base, "kind": "text", "title": "Expenses", "sub": "This month", "text": "Spending by category — drop a receipt here",
          "full": "Loading…", "_feed": "expenses", "_filled": True, "_ext": ".feed", "mono": False},
-        # live widgets: the weather and what Spotify plays are fetched in a worker thread; the clock and the system card are read
-        # by the window itself every frame
+        # live widget: the weather is fetched in a worker thread. The clock (top) and what is playing (bottom left) are not cards:
+        # HandSpaceOverlay draws them straight on the screen.
         {**base, "kind": "text", "title": "Weather", "sub": "Right now", "text": "Live forecast", "full": "Loading…",
          "_feed": "weather", "_filled": True, "_ext": ".feed", "mono": False},
-        {**base, "kind": "text", "title": "Now Playing", "sub": "Spotify", "text": "What is playing", "full": "Loading…",
-         "_feed": "nowplaying", "_filled": True, "_ext": ".feed", "mono": False},
-        {**base, "kind": "text", "title": "System", "sub": "Live", "text": "CPU · memory · disk", "full": "",
-         "_widget": "system", "_filled": True, "_ext": ".feed", "mono": False},
-        {**base, "kind": "text", "title": "Clock", "sub": "Local time", "text": "Time and date", "full": "",
-         "_widget": "clock", "_filled": True, "_ext": ".feed", "mono": False},
     ]
 
 

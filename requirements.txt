@@ -56,5 +56,11 @@ pywinauto;  sys_platform == "win32"
 pywin32;    sys_platform == "win32"
 wmi;        sys_platform == "win32"
 docx2pdf;   sys_platform == "win32"
+# Dynamic Island / Hand Space: what is playing (system media session). Replaces `winsdk`, which has no Python 3.13/3.14 wheels.
+winrt-runtime;                              sys_platform == "win32"
+winrt-Windows.Foundation;                   sys_platform == "win32"
+winrt-Windows.Foundation.Collections;       sys_platform == "win32"
+winrt-Windows.Media.Control;                sys_platform == "win32"
+winrt-Windows.Storage.Streams;              sys_platform == "win32"
 
 # by ASDcuber521

@@ -21,7 +21,7 @@ from PyQt6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QGuiApplication, Q
 from PyQt6.QtWidgets import QWidget
 
 from core.hand_space import Card, Space, human_size
-from core import map_service, space_feeds
+from core import map_service, media_session, space_feeds
 from core.space_map import TILE as MAP_TILE, ancestor as map_ancestor
 from ui import hs_gpu, hs_widgets, mesh_thumb
 from ui.fx import GL_ENABLED, samples_for
@@ -200,7 +200,14 @@ class HandSpaceOverlay(QWidget):
         self._mthumb_failed: set[str] = set()
         self._npool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hs-net")      # calendar / mail / expenses / place search
         self._njobs: list[Future] = []
-        self.sys = space_feeds.SysSampler()                          # CPU / RAM readings for the System card
+        # the clock (top) and what is playing (bottom left) are drawn straight on the screen, not as cards
+        self._mepool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hs-media")
+        self._me_job: Future | None = None
+        self._me_t = 0.0                                             # when the media state was last asked for
+        self._me: dict = {}                                          # the last media snapshot
+        self._me_a = 0.0                                             # fade of the bottom-left label: 0 hidden … 1 shown
+        self._me_text = ("", "", False)                              # what the label shows: title, line two, playing?
+        self._clock_key = -1                                         # the minute the top clock shows
         self._wlast: dict[str, float] = {}                           # live widget → when its data was last asked for
         self._wanim = 0.0
         self._tiles = None                                           # map_service.TileStore, created when the map is first opened
@@ -407,14 +414,64 @@ class HandSpaceOverlay(QWidget):
             self.update()
 
     # ── live widget cards ────────────────────────────────────────────────────────────
-    _WIDGET_EVERY = {"weather": 600.0, "nowplaying": 4.0, "calendar": 300.0, "mail": 300.0, "expenses": 120.0}
+    _WIDGET_EVERY = {"weather": 600.0, "calendar": 300.0, "mail": 300.0, "expenses": 120.0}
 
-    def sysdata(self) -> dict:
-        return self.sys.sample()
+    # ── the clock (top) and the now-playing label (bottom left) ─────────────────────────
+    def _video_showing(self):
+        """The film that is on screen right now (open card of kind video with the player running), else None."""
+        op = self.space.opened
+        if op is not None and op.open and op.data.get("kind") == "video" and self._video.active:
+            return op
+        return None
+
+    def _poll_media(self, now: float):
+        """Once a second or two: ask what plays; every minute: repaint the clock; while the label is visible: keep it fading / moving."""
+        minute = int(now // 60)
+        if minute != self._clock_key:
+            self._clock_key = minute
+            self._anim = True
+        job = self._me_job
+        if job is not None and job.done():
+            self._me_job = None
+            try:
+                res = job.result()
+            except Exception:                                        # noqa: BLE001
+                res = None
+            if isinstance(res, dict):
+                res.pop("thumb", None)
+                self._me = res
+        if self._me_job is None and now - self._me_t >= 2.0:
+            self._me_t = now
+            self._me_job = self._mepool.submit(media_session.snapshot)
+        vid = self._video_showing()
+        n = self._me
+        song = n.get("state") == "playing" and bool(n.get("title") or n.get("artist"))
+        if vid is not None:                                          # a film is on screen: its name, play / pause
+            title = str(vid.data.get("title") or "Video")
+            text = (title, "Paused" if vid.paused else "Playing video", not vid.paused)
+            want = 1.0
+        elif song:
+            text = (str(n.get("title") or n.get("artist")), str(n.get("artist") or "") if n.get("title") else "", True)
+            want = 1.0
+        else:
+            text, want = self._me_text, 0.0
+        if want > 0.0:
+            self._me_text = text
+        a = self._me_a
+        if a != want:
+            a += max(-1.0, min(1.0, (want - a) * 0.25 + (0.04 if want > a else -0.04)))
+            self._me_a = max(0.0, min(1.0, a))
+            if abs(self._me_a - want) < 0.02:
+                self._me_a = want
+            self._anim = True
+        elif a > 0.0 and self._me_text[2] and now - self._wanim >= 0.07:      # the little equaliser moves while it plays
+            self._wanim = now
+            self._anim = True
 
     def _poll_widgets(self, now: float):
         """Keep the live cards alive: ask for fresh data when it is due and keep repainting the moving ones."""
         sp = self.space
+        self._poll_media(now)
         kinds = {c.data.get("_feed") or c.data.get("_widget") for c in sp.cards if c.data.get("_feed") or c.data.get("_widget")}
         if not kinds:
             return
@@ -424,11 +481,9 @@ class HandSpaceOverlay(QWidget):
                 self._wlast[k] = now
                 sp._feed_t[k] = now
                 sp.requests.append(("feed", k))
-        due = 0.04 if ("nowplaying" in kinds or "weather" in kinds or "clock" in kinds) else 0.5      # equaliser / spinning disc / sweep hand
-        if "system" in kinds or "clock" in kinds or "nowplaying" in kinds or "weather" in kinds:
-            if now - self._wanim >= due:
-                self._wanim = now
-                self._anim = True
+        if "weather" in kinds and now - self._wanim >= 0.04:                  # the weather icon moves
+            self._wanim = now
+            self._anim = True
 
     def _gpu_stop_video(self):
         cv = self._cv
@@ -780,6 +835,8 @@ class HandSpaceOverlay(QWidget):
             if sp.empty:
                 self._draw_empty(p, W, H)
             self._draw_topbar(p, W)
+            self._draw_clock(p, W)
+            self._draw_media(p, W, H)
             if sp.prompt is None:
                 if sp.menu_box is not None:
                     self._draw_menu_panel(p, sp.menu_box)
@@ -900,6 +957,7 @@ class HandSpaceOverlay(QWidget):
         sp = self.space
         left = 40 + 2 * (76 + 12) + 14
         right = min((b["x"] for b in sp.buttons if b["id"] in ("arrange", "sort", "select", "close")), default=W - 40) - 18
+        right = max(left + 160, min(right, W / 2 - 130))               # the title stops before the clock in the middle
         bar = QLinearGradient(0, 30, 0, 88)                                  # a slim accent bar in front of the title
         bar.setColorAt(0, _q(C.PRI, 255))
         bar.setColorAt(1, _q(C.ACC, 255))
@@ -919,6 +977,57 @@ class HandSpaceOverlay(QWidget):
         p.setPen(col)
         p.drawText(QRectF(r.left() + 14, 64, r.width() - 14, 24), _AL.AlignLeft | _AL.AlignVCenter,
                    f"{len(sp.sel)} selected" if sel else sp.summary)
+
+    def _draw_clock(self, p: QPainter, W: int):
+        """The time at the top of the screen — plain text with a soft glow, no card. (Under the Dynamic Island's resting pill.)"""
+        now = time.localtime()
+        hm = time.strftime("%H:%M", now)
+        day = time.strftime("%A, %d %B", now)
+        top = 80.0
+        f = _F(30, QFont.Weight.DemiBold, spacing=1.5)
+        p.setFont(f)
+        r = QRectF(W / 2 - 150, top, 300, 40)
+        p.setPen(_q(C.PRI, 38))                                          # glow: the same text, a hair off in four directions
+        for dx, dy in ((-1.5, 0), (1.5, 0), (0, -1.5), (0, 1.5)):
+            p.drawText(r.translated(dx, dy), _AL.AlignCenter, hm)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(r, _AL.AlignCenter, hm)
+        p.setFont(_F(10, QFont.Weight.DemiBold, spacing=1.2))
+        p.setPen(QColor(C.TEXT_MED))
+        p.drawText(QRectF(W / 2 - 150, top + 38, 300, 20), _AL.AlignCenter, day.upper())
+
+    def _draw_media(self, p: QPainter, W: int, H: int):
+        """Bottom left, no card: a little equaliser and the song (or film) name. Only while a song plays or a film is on screen."""
+        a = self._me_a
+        if a < 0.02:
+            return
+        title, line2, live = self._me_text
+        x, y = 44.0, H - 74.0
+        wmax = max(160.0, min(340.0, W * 0.5 - 330))                      # never reaches the gesture hint in the middle
+        p.save()
+        p.setOpacity(a)
+        p.translate(0, (1.0 - a) * 10.0)                                 # rises into place while it fades in
+        # equaliser: four soft bars
+        t = time.time()
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(4):
+            fr = (0.35 + 0.65 * abs(math.sin(t * (2.6 + i * 0.9) + i * 1.4))) if live else 0.25
+            h = 6.0 + 20.0 * fr
+            p.setBrush(_q(C.GREEN if live else C.TEXT_DIM, 230))
+            p.drawRoundedRect(QRectF(x + i * 6.5, y + 30 - h, 4.0, h), 2.0, 2.0)
+        tx = x + 36
+        fm = QFontMetrics(_F(13, QFont.Weight.Bold))
+        p.setFont(_F(13, QFont.Weight.Bold))
+        p.setPen(QColor(0, 0, 0, 150))                                   # a soft shadow keeps it readable over any card
+        p.drawText(QRectF(tx + 1, y + 1, wmax, 20), _AL.AlignLeft | _AL.AlignVCenter, fm.elidedText(title, Qt.TextElideMode.ElideRight, int(wmax)))
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRectF(tx, y, wmax, 20), _AL.AlignLeft | _AL.AlignVCenter, fm.elidedText(title, Qt.TextElideMode.ElideRight, int(wmax)))
+        if line2:
+            f2 = _F(10)
+            p.setFont(f2)
+            p.setPen(QColor(C.TEXT_MED))
+            p.drawText(QRectF(tx, y + 20, wmax, 16), _AL.AlignLeft | _AL.AlignVCenter, QFontMetrics(f2).elidedText(line2, Qt.TextElideMode.ElideRight, int(wmax)))
+        p.restore()
 
     # ── buttons ──────────────────────────────────────────────────────────────────────
     def _draw_button(self, p: QPainter, b: dict):

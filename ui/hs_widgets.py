@@ -1,8 +1,9 @@
 """Hand Space — live widget cards and the rich Calendar / Mail / Expenses cards.
 
 The card header (badge, title, underline) is drawn by HandSpaceOverlay._card_text; this module paints what goes under it:
-  calendar · mail · expenses · weather · nowplaying · system · clock
-Every painter is pure drawing: the data comes from core.space_feeds (parsed text / JSON) and from SysSampler.
+  calendar · mail · expenses · weather
+(The clock and the now-playing label are not cards any more: HandSpaceOverlay draws them straight on the screen.)
+Every painter is pure drawing: the data comes from core.space_feeds (parsed text / JSON) .
 `paint(...)` returns False when there is nothing to draw yet (e.g. "Loading…"), so the card falls back to its plain text.
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QLinearGradient, QP
 from core import space_feeds
 from ui.theme import C
 
-LIVE = ("calendar", "mail", "expenses", "weather", "nowplaying", "system", "clock")
+LIVE = ("calendar", "mail", "expenses", "weather")
 _AL = Qt.AlignmentFlag
 PAL = [C.PRI, C.ACC, C.ACC2, C.GREEN, C.AMBER, "#7aa2ff"]
 _PARSED: dict = {}
@@ -170,10 +171,6 @@ def _message(p: QPainter, view: QRectF, text: str, col=None):
 
 # ── data ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 def _data(ov, d: dict, kind: str):
-    if kind == "system":
-        return ov.sysdata()
-    if kind == "clock":
-        return datetime.now()
     text = str(d.get("full") or "")
     key = (kind, text)
     if key in _PARSED:
@@ -185,7 +182,7 @@ def _data(ov, d: dict, kind: str):
         out = space_feeds.parse_mail(text)
     elif kind == "expenses":
         out = space_feeds.parse_expenses(text)
-    elif kind in ("weather", "nowplaying"):
+    elif kind == "weather":
         out = space_feeds.parse_json(text)
     if len(_PARSED) > 60:
         _PARSED.clear()
@@ -199,8 +196,7 @@ def paint(ov, p: QPainter, c, kind: str, view: QRectF, opened: bool) -> bool:
     data = _data(ov, d, kind)
     if data is None:
         return False
-    fn = {"calendar": _calendar, "mail": _mail, "expenses": _expenses, "weather": _weather, "nowplaying": _playing,
-          "system": _system, "clock": _clock}[kind]
+    fn = {"calendar": _calendar, "mail": _mail, "expenses": _expenses, "weather": _weather}[kind]
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     fn(ov, p, c, view, data, opened)
     return True
@@ -555,7 +551,7 @@ def _weather(ov, p, c, view, wx, opened):
             _txt(p, QRectF(r.left(), tr.bottom() + 4, r.width(), 16), f'{dd["lo"]}°', 9, C.TEXT_DIM, None, _AL.AlignHCenter)
 
 
-# ── Now playing ────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Equaliser and disc (also used by the Dynamic Island) ────────────────────────────────────────────────────────────────────────────────────────────────────
 def _equalizer(p: QPainter, r: QRectF, col, playing: bool, t: float, bars: int = 14):
     gap = r.width() / bars
     bw = gap * 0.58
@@ -596,130 +592,5 @@ def _disc(p: QPainter, c: QPointF, rad: float, t: float, spin: bool):
     p.drawPie(QRectF(-rad, -rad, rad * 2, rad * 2), 40 * 16, 30 * 16)
     p.restore()
 
-
-def _playing(ov, p, c, view, np_, opened):
-    state = np_.get("state", "none")
-    now = time.time()
-    if state == "none":
-        _disc(p, QPointF(view.center().x(), view.top() + min(view.height() * 0.34, 70)), min(view.height() * 0.24, 46), now, False)
-        _txt(p, QRectF(view.left(), view.bottom() - view.height() * 0.38, view.width(), 22), "Nothing playing", 11, C.TEXT_MED, QFont.Weight.DemiBold, _AL.AlignHCenter)
-        _txt(p, QRectF(view.left(), view.bottom() - view.height() * 0.38 + 22, view.width(), 18), "Start Spotify and it shows up here", 8, C.TEXT_DIM, None, _AL.AlignHCenter)
-        return
-    playing = state == "playing"
-    rad = min(view.height() * (0.27 if opened else 0.25), 90 if opened else 44)
-    cx = view.left() + rad + 4
-    _disc(p, QPointF(cx, view.top() + rad + 6), rad, now, playing)
-    tx = cx + rad + 16
-    tw = view.right() - tx
-    big = opened
-    _txt(p, QRectF(tx, view.top() + 2, tw, 14), "NOW PLAYING" if playing else "PAUSED", 8, C.GREEN if playing else C.AMBER, QFont.Weight.Bold)
-    _txt(p, QRectF(tx, view.top() + 18, tw, 30 if big else 22), np_.get("title") or "—", 16 if big else 11, "#ffffff", QFont.Weight.Bold)
-    _txt(p, QRectF(tx, view.top() + (50 if big else 40), tw, 20), np_.get("artist") or "", 11 if big else 9, C.TEXT_MED)
-    eq_h = max(26.0, min(view.height() * 0.3, 70.0))
-    _equalizer(p, QRectF(view.left(), view.bottom() - eq_h, view.width(), eq_h), C.GREEN, playing, now, 22 if opened else 14)
-
-
-# ── This computer ──────────────────────────────────────────────────────────────────────────────────────────────────
-def _system(ov, p, c, view, s, opened):
-    if s.get("error") or "cpu" not in s:
-        _message(p, view, s.get("error", "Reading the system…"), C.AMBER)
-        return
-    cpu, mem, disk = s["cpu"], s["mem"], s["disk"]
-    hot = lambda v: C.RED if v > 90 else (C.AMBER if v > 75 else None)       # noqa: E731
-    cc, mc, dc = hot(cpu) or C.PRI, hot(mem) or C.ACC, hot(disk) or C.GREEN
-    if not opened:
-        d = min(view.height() * 0.5, view.width() * 0.42)
-        _ring(p, QRectF(view.left(), view.top(), d, d), cpu / 100.0, cc, 6, f"{cpu:.0f}%", "CPU", 11)
-        _ring(p, QRectF(view.right() - d, view.top(), d, d), mem / 100.0, mc, 6, f"{mem:.0f}%", "RAM", 11)
-        y = view.top() + d + 10
-        _txt(p, QRectF(view.left(), y, view.width(), 14), f'Disk {disk:.0f}% · {_hb(s["disk_free"])} free', 8, C.TEXT_DIM)
-        _bar(p, QRectF(view.left(), y + 16, view.width(), 5), disk / 100.0, dc)
-        if view.bottom() - y > 44:
-            _txt(p, QRectF(view.left(), y + 24, view.width(), 14), f'↓ {_hb(s["down"])}/s  ↑ {_hb(s["up"])}/s', 8, C.TEXT_DIM)
-        return
-    w = view.width() - 6
-    y = view.top() + 4
-    half = (w - 12) / 2
-    for k, (lab, val, col, hist, sub) in enumerate((("CPU", cpu, cc, ov.sys.cpu_hist, f"{cpu:.0f}%"),
-                                                    ("MEMORY", mem, mc, ov.sys.mem_hist, f'{_hb(s["mem_used"])} of {_hb(s["mem_total"])}'))):
-        r = QRectF(view.left() + k * (half + 12), y, half, 190)
-        _card(p, r, col, 12)
-        _txt(p, QRectF(r.left() + 14, r.top() + 8, r.width() - 20, 18), lab, 9, C.TEXT_DIM, QFont.Weight.Bold)
-        _txt(p, QRectF(r.left() + 14, r.top() + 26, r.width() - 20, 38), f"{val:.0f}%", 26, "#ffffff", QFont.Weight.Bold)
-        if k:
-            _txt(p, QRectF(r.left() + 14, r.top() + 62, r.width() - 20, 16), sub, 9, C.TEXT_MED)
-        _area(p, QRectF(r.left() + 12, r.top() + 84, r.width() - 24, 90), hist, col)
-    y += 206
-    _txt(p, QRectF(view.left(), y, w * 0.6, 20), "Disk", 11, "#ffffff", QFont.Weight.DemiBold)
-    _txt(p, QRectF(view.left(), y, w, 20), f'{_hb(s["disk_free"])} free of {_hb(s["disk_total"])}', 10, C.TEXT_MED, None, _AL.AlignRight)
-    _bar(p, QRectF(view.left(), y + 26, w, 8), disk / 100.0, dc)
-    y += 52
-    secs = max(0, int(time.time() - s["boot"]))
-    up = f"{secs // 86400}d {secs % 86400 // 3600}h" if secs >= 86400 else f"{secs // 3600}h {secs % 3600 // 60}m"
-    tiles = [("DOWNLOAD", f'{_hb(s["down"])}/s', C.PRI), ("UPLOAD", f'{_hb(s["up"])}/s', C.ACC2), ("UPTIME", up, C.AMBER)]
-    if s.get("bat") is not None:
-        tiles.append(("BATTERY", f'{s["bat"]:.0f}%' + (" ⚡" if s.get("plugged") else ""), C.GREEN))
-    tw = (w - 6 * (len(tiles) - 1)) / len(tiles)
-    for k, (lab, val, col) in enumerate(tiles):
-        r = QRectF(view.left() + k * (tw + 6), y, tw, 56)
-        _card(p, r, col)
-        _txt(p, QRectF(r.left() + 10, r.top() + 7, r.width() - 12, 16), lab, 8, C.TEXT_DIM)
-        _txt(p, QRectF(r.left() + 10, r.top() + 24, r.width() - 12, 26), val, 12, "#ffffff", QFont.Weight.Bold)
-
-
-# ── Clock ──────────────────────────────────────────────────────────────────────────────────────────────────────────
-def _analog(p: QPainter, r: QRectF, now: datetime, col):
-    cx, cy, rad = r.center().x(), r.center().y(), min(r.width(), r.height()) / 2 - 3
-    g = QRadialGradient(QPointF(cx, cy), rad)
-    g.setColorAt(0, _q(col, 24))
-    g.setColorAt(1, _q(col, 5))
-    p.setPen(QPen(_q(col, 150), 1.6))
-    p.setBrush(QBrush(g))
-    p.drawEllipse(QPointF(cx, cy), rad, rad)
-    for i in range(60):
-        a = math.radians(i * 6 - 90)
-        big = i % 5 == 0
-        r1, r2 = rad * (0.84 if big else 0.91), rad * 0.96
-        p.setPen(QPen(QColor(255, 255, 255, 190 if big else 60), 1.6 if big else 1.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawLine(QPointF(cx + math.cos(a) * r1, cy + math.sin(a) * r1), QPointF(cx + math.cos(a) * r2, cy + math.sin(a) * r2))
-    ms = time.time() % 1.0
-    sec = now.second + ms
-    for ang, ln, wd, cl in (((now.hour % 12 + now.minute / 60) * 30, 0.5, 4.2, "#ffffff"), ((now.minute + sec / 60) * 6, 0.74, 3.0, "#ffffff"),
-                            (sec * 6, 0.82, 1.6, C.ACC2)):
-        a = math.radians(ang - 90)
-        p.setPen(QPen(QColor(cl), wd, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawLine(QPointF(cx - math.cos(a) * rad * 0.1, cy - math.sin(a) * rad * 0.1), QPointF(cx + math.cos(a) * rad * ln, cy + math.sin(a) * rad * ln))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(C.ACC2))
-    p.drawEllipse(QPointF(cx, cy), 4, 4)
-
-
-def _clock(ov, p, c, view, now: datetime, opened):
-    col = C.PRI
-    if not opened:
-        _txt(p, QRectF(view.left(), view.top(), view.width(), view.height() * 0.5), now.strftime("%H:%M"), 30, "#ffffff", QFont.Weight.Bold, _AL.AlignHCenter)
-        sec = (now.second + (time.time() % 1.0)) / 60.0
-        _bar(p, QRectF(view.left() + 6, view.top() + view.height() * 0.52, view.width() - 12, 4), sec, col)
-        _txt(p, QRectF(view.left(), view.top() + view.height() * 0.6, view.width(), 18), now.strftime("%A"), 10, C.TEXT_MED, QFont.Weight.DemiBold, _AL.AlignHCenter)
-        _txt(p, QRectF(view.left(), view.top() + view.height() * 0.6 + 18, view.width(), 16), now.strftime("%d %B %Y"), 9, C.TEXT_DIM, None, _AL.AlignHCenter)
-        return
-    s = min(view.height() * 0.62, view.width() * 0.5, 280)
-    _analog(p, QRectF(view.left() + 4, view.top() + 8, s, s), now, col)
-    tx = view.left() + s + 30
-    tw = view.right() - tx
-    _txt(p, QRectF(tx, view.top() + 10, tw, 70), now.strftime("%H:%M"), 52, "#ffffff", QFont.Weight.Bold)
-    _txt(p, QRectF(tx, view.top() + 78, tw, 28), now.strftime(":%S"), 18, C.ACC2, QFont.Weight.DemiBold)
-    _txt(p, QRectF(tx, view.top() + 112, tw, 26), now.strftime("%A"), 16, C.TEXT, QFont.Weight.DemiBold)
-    _txt(p, QRectF(tx, view.top() + 138, tw, 22), now.strftime("%d %B %Y"), 12, C.TEXT_MED)
-    y = view.top() + s + 34
-    day = (now.hour * 3600 + now.minute * 60 + now.second) / 86400.0
-    yr = (now.timetuple().tm_yday - 1 + day) / (366.0 if now.year % 4 == 0 else 365.0)
-    wk = now.isocalendar()[1]
-    w = view.width() - 14
-    for lab, frac, val, cl in (("Today", day, f"{day * 100:.0f}%", C.PRI), ("This year", yr, f"{yr * 100:.0f}% · week {wk}", C.ACC)):
-        _txt(p, QRectF(view.left(), y, w * 0.5, 18), lab, 10, C.TEXT_MED)
-        _txt(p, QRectF(view.left(), y, w, 18), val, 10, C.TEXT_DIM, None, _AL.AlignRight)
-        _bar(p, QRectF(view.left(), y + 22, w, 6), frac, cl)
-        y += 42
 
 #by ASDcuber

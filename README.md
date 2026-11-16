@@ -186,15 +186,14 @@ Optional settings in `config/api_keys.json`:
 
 A floating glass player sits at the top of your screen — a little below the edge — and stays **above everything, Hand Space included**.
 
-* **Resting:** a slim pill. The time in the middle; the cover and an equaliser while music plays, the weather otherwise.
-* **Hover, click, or a new song:** it opens into a player card tinted with the colour of the cover — cover, title, artist, album, a progress bar you can click to seek, and ⏮ ⏯ ⏭.
-* **⋮ button:** flips the card to the clock, date and weather page (with the next days). **♪ player** flips it back.
-* **Drag it** anywhere — the spot is remembered. **Right-click:** pin open, reset position, or hide. Off for good: `"dynamic_island": false`.
+* **Resting:** a small dark pill. Time | weather and an orange dot; while music plays: a round cover, an equaliser and the dot.
+* **Hover, click, or a new song:** it opens into the card tinted with the colour of the cover. **Click the orange dot** for the next page: the player (cover, title, artist, a progress bar you can click to seek, ⏮ ⏯ ⏭) → the calendar (the day big, the month with today in red) → clock, date and weather.
+* **Pull it down** with the mouse to open it (it follows your hand and stays open if you pull far enough); **pull it up** to shut it. **Shift+drag** (or drag sideways) moves it — the spot is remembered. **Right-click:** open / close, reset position, or hide. Off for good: `"dynamic_island": false`.
 
-It works with **any player** on Windows (Spotify, YouTube in Chrome, VLC…) once you install the optional package below. Without it, it falls back to Spotify's window title: title and artist only, no cover or progress.
+It works with **any player** on Windows (Spotify, YouTube in Chrome, VLC…) through the `winrt-*` packages (they are in `requirements.txt` and work on Python 3.14). Without them it falls back to Spotify's window title: title and artist only, no cover or progress.
 
 ```bash
-pip install winsdk
+pip install winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Media.Control winrt-Windows.Storage.Streams
 ```
 
 Weather and music use the same sources and settings as the [live cards](#live-cards).
