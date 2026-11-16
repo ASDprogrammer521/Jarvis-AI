@@ -159,6 +159,29 @@ Ship the beta on Friday.
 
 The first note creates a home for your cards at `…/hand_space_notes` and pins it automatically. Notes without front matter simply use the default note colour.
 
+### Live cards
+
+Some cards are not files — they show live data and keep updating while Hand Space is open. Open one (pinch it) for the big view; scroll it like any note.
+
+| Card | What it shows | Refresh |
+|---|---|---|
+| 🌤 **Weather** | Temperature, feels-like, humidity, wind and a 5-day outlook with animated icons | every 10 min |
+| 🎵 **Now Playing** | What Spotify is playing, with a spinning disc and equaliser | every 4 s |
+| 🖥 **System** | CPU and memory gauges with history graphs, disk, network speed, battery, uptime | every second |
+| 🕐 **Clock** | Digital time and an analog dial, date, progress of the day and year | every second |
+| 📅 **Calendar** | Meetings grouped by day, with times and places | every 5 min |
+| 📬 **Mail** | Unread count and your latest emails (read-only) | every 5 min |
+| 💳 **Expenses** | Spent / income / balance, a category donut, bars with budget warnings and the latest entries | every 2 min |
+
+Optional settings in `config/api_keys.json`:
+
+```json
+{ "hs_weather_city": "Tashkent", "hs_weather_units": "c" }
+```
+
+> [!NOTE]
+> **Weather uses the network.** Data comes from [Open-Meteo](https://open-meteo.com/) (free, no key). Without `hs_weather_city` it finds your rough location from your IP address through ipapi.co — set the city if you would rather not. Use `"hs_weather_units": "f"` for °F / mph. **Now Playing** reads Spotify's window title on Windows, so it shows the song only while Spotify is running.
+
 ### Hand outline
 
 The **Show hand outline** switch on the Hand Space page draws the thin bones of your hand. Off = only the fingertip and pinch rings. Hand Space draws on the graphics card when GPU acceleration is on and falls back to the standard renderer on its own if needed (Settings → Appearance → Performance).
@@ -550,7 +573,7 @@ Jarvis-ai/
 ├── requirements.txt        # the only requirements file
 ├── actions/                # built-in tools
 ├── plugins/                # drop-in plugins
-├── core/                   # avatar, audio, LLM, updater, camera hub (gestures + Face ID), Hand Space…
+├── core/                   # avatar, audio, LLM, updater, camera hub (gestures + Face ID), Hand Space, live card feeds…
 ├── dashboard/              # remote server + web companion
 ├── android/JarvisApp/      # native Android companion (Kotlin) — dialer, calls, quick actions
 ├── scripts/build_exe.ps1   # local Windows packaging
