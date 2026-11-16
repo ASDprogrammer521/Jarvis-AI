@@ -979,22 +979,23 @@ class HandSpaceOverlay(QWidget):
                    f"{len(sp.sel)} selected" if sel else sp.summary)
 
     def _draw_clock(self, p: QPainter, W: int):
-        """The time at the top of the screen — plain text with a soft glow, no card. (Under the Dynamic Island's resting pill.)"""
+        """The time and date on one line at the very top of the screen — plain text, no card. (Above the Dynamic Island's pill.)"""
         now = time.localtime()
         hm = time.strftime("%H:%M", now)
-        day = time.strftime("%A, %d %B", now)
-        top = 80.0
-        f = _F(30, QFont.Weight.DemiBold, spacing=1.5)
-        p.setFont(f)
-        r = QRectF(W / 2 - 150, top, 300, 40)
-        p.setPen(_q(C.PRI, 38))                                          # glow: the same text, a hair off in four directions
-        for dx, dy in ((-1.5, 0), (1.5, 0), (0, -1.5), (0, 1.5)):
-            p.drawText(r.translated(dx, dy), _AL.AlignCenter, hm)
+        day = time.strftime("%A, %d %B", now).upper()
+        fh, fd = _F(15, QFont.Weight.DemiBold, spacing=1.0), _F(9, QFont.Weight.DemiBold, spacing=1.2)
+        wh, wd = QFontMetrics(fh).horizontalAdvance(hm), QFontMetrics(fd).horizontalAdvance(day)
+        x = W / 2 - (wh + 14 + wd) / 2
+        r = QRectF(x, 6, wh + 4, 24)
+        p.setFont(fh)
+        p.setPen(_q(C.PRI, 40))                                          # soft glow
+        for dx, dy in ((-1.2, 0), (1.2, 0), (0, -1.2), (0, 1.2)):
+            p.drawText(r.translated(dx, dy), _AL.AlignLeft | _AL.AlignVCenter, hm)
         p.setPen(QColor("#ffffff"))
-        p.drawText(r, _AL.AlignCenter, hm)
-        p.setFont(_F(10, QFont.Weight.DemiBold, spacing=1.2))
+        p.drawText(r, _AL.AlignLeft | _AL.AlignVCenter, hm)
+        p.setFont(fd)
         p.setPen(QColor(C.TEXT_MED))
-        p.drawText(QRectF(W / 2 - 150, top + 38, 300, 20), _AL.AlignCenter, day.upper())
+        p.drawText(QRectF(x + wh + 14, 6, wd + 4, 24), _AL.AlignLeft | _AL.AlignVCenter, day)
 
     def _draw_media(self, p: QPainter, W: int, H: int):
         """Bottom left, no card: a little equaliser and the song (or film) name. Only while a song plays or a film is on screen."""
