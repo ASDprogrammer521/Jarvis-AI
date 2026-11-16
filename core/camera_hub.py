@@ -13,7 +13,8 @@ import time
 from core import face_id, gesture, hand_cursor
 
 HAND_GAP_GESTURES = 1 / 15    # one-shot gestures only need ~15 fps; the hand mouse and Hand Space still use every frame
-FACE_EVERY = 0.4          # seconds between face checks (gestures are checked on every frame)
+FACE_EVERY = 0.4          # seconds between face checks while somebody is in view (gestures are checked on every frame)
+FACE_IDLE = 0.6           # …and while nobody is: only a quick search for a face, no recogniser
 FACE_EVERY_SPACE = 2.0    # …but while Hand Space is open the CPU belongs to the hand tracking (the face lock only needs a sighting now and then)
 PROFILE = bool(os.environ.get("JARVIS_PROFILE"))
 KNOWN_COOLDOWN = 45.0     # don't greet the same person again within this many seconds
@@ -79,6 +80,108 @@ class _HandWorker(threading.Thread):
                 return
             finally:
                 self._busy = False
+
+
+class _FaceWorker(threading.Thread):
+    """Finds and recognises faces off the camera thread, so Hand Space and the gestures never wait for it.
+
+    Per check: look for faces on a small picture; only when one is there does the recogniser start, and a known face that
+    stays where it was is trusted for a few seconds (face_id.FaceTracker). The camera keeps reading frames meanwhile and
+    hands over only the newest one; while this thread is busy, frames for it are simply skipped."""
+
+    def __init__(self, hub):
+        super().__init__(daemon=True, name="jarvis-faces")
+        self.hub = hub
+        self.error: Exception | None = None
+        self.present = False                  # was a face in the last picture? (decides how often the camera hands one over)
+        self.ms = 0.0
+        self.checks = 0
+        self._frame = None
+        self._busy = False
+        self._quit = False
+        self._cv = threading.Condition()
+        self._tracker = face_id.FaceTracker()
+        self._last_known: dict[str, float] = {}
+        self._last_unknown = 0.0
+        self._unknown_streak = 0
+
+    def ready(self) -> bool:
+        return not self._busy and self._frame is None and not self._quit and self.error is None
+
+    def submit(self, frame, now: float) -> None:
+        with self._cv:
+            self._frame = (frame, now)
+            self._cv.notify()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._quit = True
+            self._frame = None
+            self._cv.notify()
+        if threading.current_thread() is not self:
+            self.join(timeout=3)
+
+    def run(self):
+        hub = self.hub
+        engine = None
+        while True:
+            with self._cv:
+                while self._frame is None and not self._quit:
+                    self._cv.wait(0.25)
+                if self._quit:
+                    return
+                (frame, now), self._frame = self._frame, None
+                self._busy = True
+            try:
+                t0 = time.perf_counter()
+                if engine is None:
+                    hub._set("loading face model…")
+                    engine = face_id.FaceEngine()
+                    hub._set("active")
+                self._check(engine, frame, now)
+                ms = (time.perf_counter() - t0) * 1000
+                self.ms = self.ms * 0.9 + ms * 0.1 if self.checks else ms
+                self.checks += 1
+                if PROFILE and self.checks % 20 == 0:
+                    print(f"[camera] face check {self.ms:.1f} ms ({'face in view' if self.present else 'empty'}, "
+                          f"recogniser {'on' if engine.rec_ready else 'not loaded'})")
+            except Exception as e:                # surfaced by the camera loop as the camera status
+                self.error = e
+                return
+            finally:
+                self._busy = False
+
+    def _check(self, engine, frame, now: float):
+        hub = self.hub
+        faces = engine.detect(frame)
+        self.present = bool(faces)
+        enroll = hub._enroll
+        if enroll is not None:
+            hub._enroll_step(engine, frame, faces, enroll, now)
+        if not hub._f:
+            return
+        if faces and not engine.rec_ready:
+            hub._set("loading face model…")                   # the recogniser starts only now that a face is in view
+            engine.rec
+            hub._set("active")
+        names = self._tracker.resolve(faces, now, lambda f: engine.identify(engine.embed(frame, f))[0]) if faces else self._tracker.resolve([], now, None)
+        seen = [n or "unknown" for n in names]
+        hub.visible, hub.seen_at = seen, now
+        try:
+            hub.on_seen([n for n in seen if n != "unknown"])
+        except Exception:
+            pass
+        for name in {s for s in seen if s != "unknown"}:
+            if now - self._last_known.get(name, 0.0) > KNOWN_COOLDOWN:   # back after a break, not just still sitting there
+                hub.on_face("known", name)
+            self._last_known[name] = now
+        if "unknown" in seen and face_id.names():
+            self._unknown_streak += 1
+            if self._unknown_streak >= 3 and now - self._last_unknown > UNKNOWN_COOLDOWN and face_id.alert_unknown():
+                self._last_unknown = now
+                hub.on_face("unknown", "")
+        else:
+            self._unknown_streak = 0
 
 
 class CameraHub:
@@ -171,13 +274,10 @@ class CameraHub:
         return cap
 
     def _run(self):
-        cap = hands = engine = worker = None
+        cap = hands = faceworker = worker = None
         tracker = gesture.GestureTracker()
         cursor = None
         last_face = 0.0
-        last_known: dict[str, float] = {}
-        last_unknown = 0.0
-        unknown_streak = 0
         last_hand = 0.0
         _prof = [0.0, 0]
         try:
@@ -188,14 +288,22 @@ class CameraHub:
             while not self._stop.is_set():
                 if not self._wanted():
                     break
+                if faceworker is not None and faceworker.error is not None:
+                    raise faceworker.error             # the face thread failed (missing model, old OpenCV…): show it as the camera status
                 # Skip frames nobody needs: grab() drops a frame without decoding it, so the hand / face models stay idle
                 t_now = time.time()
                 hands_on = self._g or self._c or self.space
                 hand_gap = 0.0 if (self._c or self.space) else HAND_GAP_GESTURES
                 hand_due = hands_on and t_now - last_hand >= hand_gap
-                face_gap = FACE_EVERY if (self._enroll is not None or not self.space) else FACE_EVERY_SPACE
-                face_due = (self._f or self._enroll is not None) and t_now - last_face >= face_gap
-                cleanup = (not hands_on and (hands is not None or cursor is not None)) or (not self._f and engine is not None and self._enroll is None)
+                if self._enroll is not None or (not self.space and faceworker is not None and faceworker.present):
+                    face_gap = FACE_EVERY
+                elif self.space:
+                    face_gap = FACE_EVERY_SPACE
+                else:
+                    face_gap = FACE_IDLE if faceworker is not None else FACE_EVERY
+                face_due = ((self._f or self._enroll is not None) and t_now - last_face >= face_gap
+                            and (faceworker is None or faceworker.ready()))
+                cleanup = (not hands_on and (hands is not None or cursor is not None)) or (not self._f and faceworker is not None and self._enroll is None)
                 if not (hand_due or face_due or cleanup):
                     cap.grab()
                     time.sleep(0.008)
@@ -268,42 +376,21 @@ class CameraHub:
                         hands = None
                     self.current_gesture = None
 
-                # ── faces ──
+                # ── faces: handed to their own thread; this loop only passes on the newest frame ──
                 enroll = self._enroll
-                if (self._f or enroll) and now - last_face >= face_gap:
-                    last_face = now
-                    if engine is None:
-                        self._set("loading face model…")
-                        engine = face_id.FaceEngine()
-                        self._set("active")
-                    faces = engine.detect(frame)
-                    if enroll is not None:
-                        self._enroll_step(engine, frame, faces, enroll, now)
-                    if self._f:
-                        seen = []
-                        for f in faces:
-                            name, _ = engine.identify(engine.embed(frame, f))
-                            seen.append(name or "unknown")
-                        self.visible, self.seen_at = seen, now
-                        try:
-                            self.on_seen([n for n in seen if n != "unknown"])
-                        except Exception:
-                            pass
-                        for name in {s for s in seen if s != "unknown"}:
-                            if now - last_known.get(name, 0.0) > KNOWN_COOLDOWN:   # back after a break, not just still sitting there
-                                self.on_face("known", name)
-                            last_known[name] = now
-                        if "unknown" in seen and face_id.names():
-                            unknown_streak += 1
-                            if unknown_streak >= 3 and now - last_unknown > UNKNOWN_COOLDOWN and face_id.alert_unknown():
-                                last_unknown = now
-                                self.on_face("unknown", "")
-                        else:
-                            unknown_streak = 0
-                else:
-                    if not self._f and engine is not None and enroll is None:
-                        engine = None
-                        self.visible = []
+                if self._f or enroll:
+                    if faceworker is not None and faceworker.error is not None:
+                        raise faceworker.error
+                    if face_due:
+                        if faceworker is None:
+                            faceworker = _FaceWorker(self)
+                            faceworker.start()
+                        last_face = now
+                        faceworker.submit(frame, now)
+                elif faceworker is not None:
+                    faceworker.stop()
+                    faceworker = None
+                    self.visible = []
                 time.sleep(0.005)
         except ImportError as e:
             self._set(f"missing package: pip install opencv-python mediapipe ({e.name})")
@@ -320,6 +407,8 @@ class CameraHub:
                 (self.on_hand(None, 0.0), self.on_cursor(0, 0, "lost"))
             if worker is not None:
                 worker.stop()
+            if faceworker is not None:
+                faceworker.stop()
             if hands is not None:
                 hands.close()
             self.current_gesture = None
@@ -327,7 +416,7 @@ class CameraHub:
             if not self.status.startswith(("error", "missing")):
                 self._set("off")
 
-    def _enroll_step(self, engine, frame, faces, enroll, now):
+    def _enroll_step(self, engine, frame, faces, enroll, now):                  # runs on the face thread
         if now - enroll["t0"] > ENROLL_TIMEOUT:
             self._enroll = None
             self.on_face("enroll_failed", f"{enroll['name']}: I didn't see a clear face — look straight at the camera")
@@ -340,3 +429,5 @@ class CameraHub:
             face_id.add_person(enroll["name"], enroll["vecs"])
             self._enroll = None
             self.on_face("enrolled", enroll["name"])
+
+#by ASDcuber

@@ -11,7 +11,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from PyQt6.QtCore import QCoreApplication, QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QFont, QImage, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QPolygonF, QRadialGradient, QSurfaceFormat
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -93,36 +93,109 @@ class StageHost(QWidget):
         stage.setParent(self)
         self.floats: dict[str, QWidget] = {}
         self.media_full = False
+        self.float_parent: QWidget | None = None      # the floating panels (toast, alert, video…) are children of this widget …
+        self.pages_ref: QStackedWidget | None = None   # … so they show on EVERY page, not only on Home
+        self.on_layout = None
 
     def resizeEvent(self, e):
         self.stage.setGeometry(0, 0, self.width(), self.height())
         self.layout_floats()
         super().resizeEvent(e)
 
+    def area(self) -> QRect:
+        """Where the floating panels live, in the float parent's coordinates: the stage on Home, the whole page area elsewhere."""
+        fp, pg = self.float_parent, self.pages_ref
+        if fp is None:
+            return QRect(0, 0, self.width(), self.height())
+        if pg is None or pg.currentIndex() == 0:
+            return QRect(self.mapTo(fp, QPoint(0, 0)), self.size())
+        return QRect(pg.mapTo(fp, QPoint(0, 0)), pg.size())
+
     def layout_floats(self):
-        W, H = self.width(), self.height()
+        a = self.area()
+        X, Y, W, H = a.x(), a.y(), a.width(), a.height()
         c = self.floats.get("content")
         if c is not None and c.isVisible():
             h = int(min(320, H * 0.5))
-            c.setGeometry(18, H - h - 10, W - 36, h)
+            c.setGeometry(X + 18, Y + H - h - 10, W - 36, h)
         m = self.floats.get("media")
         if m is not None and m.isVisible():
             if self.media_full:
-                m.setGeometry(0, 0, W, H)
+                m.setGeometry(X, Y, W, H)
             else:
                 media_w = min(960, max(360, min(int(W * 0.66), W - 28)))
                 extra = getattr(self, "media_extra", 0)
                 if int(media_w * 9 / 16) + 58 + extra > H - 24:      # tall panel (suggestions row): shrink the video, keep 16:9
                     media_w = max(360, min(media_w, int((H - 24 - 58 - extra) * 16 / 9)))
                 media_h = max(220, min(H - 24, int(media_w * 9 / 16) + 58 + extra))
-                m.setGeometry(max(12, W - media_w - 12), 12, media_w, media_h)
+                m.setGeometry(X + max(12, W - media_w - 12), Y + 12, media_w, media_h)
         k = self.floats.get("clip")
         if k is not None and k.isVisible():
-            k.setGeometry(int((W - min(W - 40, 620)) / 2), 12, min(W - 40, 620), 96)
+            k.setGeometry(X + int((W - min(W - 40, 620)) / 2), Y + 12, min(W - 40, 620), 96)
         t = self.floats.get("toast")
         if t is not None and t.isVisible():
             t.adjustSize()
-            t.move(int((W - t.width()) / 2), 14)
+            t.move(X + int((W - t.width()) / 2), Y + 14)
+        al = self.floats.get("alert")
+        if al is not None and al.isVisible():
+            al.adjustSize()
+            al.move(X + int((W - al.width()) / 2), Y + int(H * 0.36))
+        cb = self.on_layout
+        if cb is not None:
+            cb()                                           # the mpv window follows the panel at once, not on the next timer tick
+
+
+class _PageWatch(QObject):
+    """Tells the floating panels when the page area moves or resizes (Home's stage is hidden on other pages and gets no resize)."""
+
+    def __init__(self, host: StageHost):
+        super().__init__(host)
+        self.host = host
+
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QEvent.Type.Resize, QEvent.Type.Move):
+            self.host.layout_floats()
+        return False
+
+
+class FrameLabel(QLabel):
+    """The HUD picture (camera, phone screen, video frames), painted straight from the QImage.
+
+    Before, every frame was turned into a QPixmap and scaled into a second pixmap, and — because the label was see-through —
+    the glass card behind it was repainted too. Now the frame is drawn once, scaled by the painter, onto an opaque black
+    background, so only this label repaints."""
+
+    def __init__(self):
+        super().__init__()
+        self._img: QImage | None = None
+        self._smooth = True
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+    def set_frame(self, img: QImage, smooth: bool = True):
+        self._img, self._smooth = img, smooth
+        self.update()
+
+    def clear(self):
+        self._img = None
+        super().clear()
+        self.update()
+
+    def setPixmap(self, pm):
+        self._img = None
+        super().setPixmap(pm)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+        img = self._img
+        if img is None or img.isNull():
+            super().paintEvent(e)
+            return
+        W, H = self.width(), self.height()
+        k = min(W / img.width(), H / img.height())
+        w, h = img.width() * k, img.height() * k
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self._smooth and k < 1.6)
+        p.drawImage(QRectF((W - w) / 2, (H - h) / 2, w, h), img)
 
 
 class SeekSlider(QSlider):
@@ -467,6 +540,7 @@ class MainWindow(QMainWindow):
     _reconfig_sig = pyqtSignal()
     _cam_stream_sig = pyqtSignal(bool)
     _cam_frame_sig = pyqtSignal(bytes)
+    _cam_img_sig = pyqtSignal(object)
     _phone_frame_sig = pyqtSignal(str)
     _media_frame_sig = pyqtSignal(bytes, str)
     _mpv_open_sig = pyqtSignal(object)
@@ -569,6 +643,9 @@ class MainWindow(QMainWindow):
         self._reconfig_sig.connect(self._show_setup)
         self._cam_stream_sig.connect(self._camera_toggle)
         self._cam_frame_sig.connect(self._camera_frame)
+        self._cam_img_sig.connect(self._camera_image)
+        self._cam_pending = False
+        self._cam_px = (640, 480)
         self._phone_frame_sig.connect(self._phone_frame)
         self._media_frame_sig.connect(self._on_media_frame)
         self._mpv_open_sig.connect(self._mpv_open)
@@ -824,13 +901,13 @@ class MainWindow(QMainWindow):
         self._content = self._make_content()
         self._media = self._make_media()
         self._clip = self._make_clip()
-        self._toast_w = GlassCard(self.host, radius=18, tint=210, accent=C.PRI)
+        self._toast_w = GlassCard(self.backdrop, radius=18, tint=210, accent=C.PRI)
         tl = QHBoxLayout(self._toast_w)
         tl.setContentsMargins(16, 9, 16, 9)
         self._toast_lbl = QLabel()
         tl.addWidget(self._toast_lbl)
         self._toast_w.hide()
-        self._alert_w = GlassCard(self.host, radius=26, tint=225, accent=C.RED)
+        self._alert_w = GlassCard(self.backdrop, radius=26, tint=225, accent=C.RED)
         al = QVBoxLayout(self._alert_w)
         al.setContentsMargins(46, 26, 46, 26)
         al.setSpacing(4)
@@ -850,8 +927,14 @@ class MainWindow(QMainWindow):
         self._alert_blink = QTimer(self)
         self._alert_blink.timeout.connect(self._alert_pulse)
         self._alert_on = False
+        self.host.float_parent = self.backdrop
+        self.host.pages_ref = self.pages
         self.host.floats = {"content": self._content, "media": self._media,
-                            "clip": self._clip, "toast": self._toast_w}
+                            "clip": self._clip, "toast": self._toast_w, "alert": self._alert_w}
+        self.host.on_layout = lambda: self._mpv_win is not None and self._sync_mpv_geometry()
+        self.pages.currentChanged.connect(lambda _i: self.host.layout_floats())
+        _w = _PageWatch(self.host)
+        self.pages.installEventFilter(_w)
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self._toast_w.hide)
@@ -860,7 +943,7 @@ class MainWindow(QMainWindow):
         self._media_timer.timeout.connect(self._close_media)
 
     def _make_content(self) -> GlassCard:
-        c = GlassCard(self.host, radius=22, tint=190)
+        c = GlassCard(self.backdrop, radius=22, tint=190)
         c.hide()
         l = QVBoxLayout(c)
         l.setContentsMargins(20, 14, 14, 16)
@@ -883,7 +966,7 @@ class MainWindow(QMainWindow):
         return c
 
     def _make_media(self) -> GlassCard:
-        c = GlassCard(self.host, radius=20, tint=200, accent=C.ACC)
+        c = GlassCard(self.backdrop, radius=20, tint=200, accent=C.ACC)
         c.hide()
         l = QVBoxLayout(c)
         l.setContentsMargins(12, 10, 10, 12)
@@ -899,7 +982,7 @@ class MainWindow(QMainWindow):
         x.clicked.connect(self._close_media_user)
         h.addWidget(x)
         l.addLayout(h)
-        self._media_lbl = QLabel()
+        self._media_lbl = FrameLabel()
         self._media_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._media_lbl.setMinimumSize(1, 1)
         self._media_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
@@ -926,7 +1009,7 @@ class MainWindow(QMainWindow):
         return bar
 
     def _make_clip(self) -> GlassCard:
-        c = GlassCard(self.host, radius=20, tint=210, accent=C.PRI)
+        c = GlassCard(self.backdrop, radius=20, tint=210, accent=C.PRI)
         c.hide()
         l = QVBoxLayout(c)
         l.setContentsMargins(16, 10, 10, 10)
@@ -964,7 +1047,7 @@ class MainWindow(QMainWindow):
             self._clip_prev.setText(f"“{pv[:70]}{'…' if len(pv) > 70 else ''}”")
             self._clip.show()
             self.host.layout_floats()
-            self._clip.raise_()
+            self._front(self._clip)
             fade_in(self._clip, 240)
             QTimer.singleShot(12000, self._clip.hide)
         except Exception:
@@ -1844,10 +1927,9 @@ class MainWindow(QMainWindow):
     def _show_unknown_alert(self):
         """Red card in the middle of the HUD for ~4 s, then Jarvis says it out loud."""
         w = self._alert_w
-        w.adjustSize()
-        w.move(int((self.host.width() - w.width()) / 2), int(self.host.height() * 0.36))
         w.show()
-        w.raise_()
+        self.host.layout_floats()                       # centred over the page you are on (Home, Chat, Dashboard…)
+        self._front(w)
         fade_in(w, 220)
         self._alert_on = True
         self._alert_blink.start(450)
@@ -2046,17 +2128,21 @@ class MainWindow(QMainWindow):
         self._content_text.setPlainText(str(text))
         self._content.show()
         self.host.layout_floats()
-        self._content.raise_()
+        self._front(self._content)
         end = self._content.pos()
         self._content.move(end.x(), end.y() + 40)
         slide_to(self._content, end, 360)
         fade_in(self._content, 300)
 
+    def _front(self, w):
+        w.raise_()
+        self.side.raise_()
+
     def _toast(self, msg: str):
         self._toast_lbl.setText(msg)
         self._toast_w.show()
         self.host.layout_floats()
-        self._toast_w.raise_()
+        self._front(self._toast_w)
         fade_in(self._toast_w, 200)
         self._toast_timer.start(3200)
 
@@ -2093,6 +2179,7 @@ class MainWindow(QMainWindow):
     def _camera_toggle(self, on: bool):
         if on and not self._cam_run:
             self._cam_run = True
+            self._cam_pending = False
             self._media_title.setText("CAMERA")
             self._media.show()
             self.host.layout_floats()
@@ -2103,26 +2190,40 @@ class MainWindow(QMainWindow):
             self._hide_media()
 
     def _cam_worker(self):
+        """Camera preview: the frame is converted and shrunk to the panel's size here, in the worker, and handed over as a QImage
+        (no JPEG encode + decode, no scaling on the GUI thread). A frame is only sent when the previous one has been shown."""
         try:
             import cv2
             cap = cv2.VideoCapture(0)
             while self._cam_run and cap.isOpened():
                 ok, frame = cap.read()
-                if ok:
-                    ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    if ok2:
-                        self._cam_frame_sig.emit(buf.tobytes())
-                time.sleep(0.05)
+                if ok and not self._cam_pending:
+                    tw, th = self._cam_px
+                    h, w = frame.shape[:2]
+                    k = min(tw / w, th / h, 1.0)
+                    if k < 0.98:
+                        frame = cv2.resize(frame, (max(1, int(w * k)), max(1, int(h * k))), interpolation=cv2.INTER_AREA)
+                        h, w = frame.shape[:2]
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    self._cam_pending = True
+                    self._cam_img_sig.emit(QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy())
+                time.sleep(0.04)
             cap.release()
         except Exception as e:
             self._log_sig.emit(f"ERR: camera — {e}")
             self._cam_run = False
 
+    def _camera_image(self, img):
+        self._cam_pending = False
+        lbl = self._media_lbl
+        self._cam_px = (max(160, lbl.width()), max(120, lbl.height()))
+        if self._media.isVisible() and isinstance(img, QImage):
+            lbl.set_frame(img, smooth=False)               # already the right size: a straight copy to the screen
+
     def _camera_frame(self, data: bytes):
         img = QImage.fromData(data)
         if not img.isNull() and self._media.isVisible():
-            self._media_lbl.setPixmap(QPixmap.fromImage(img).scaled(
-                self._media_lbl.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            self._media_lbl.set_frame(img)
 
     def start_camera_stream(self):
         self._cam_stream_sig.emit(True)
@@ -2146,8 +2247,7 @@ class MainWindow(QMainWindow):
             self._media.show()
             self.host.layout_floats()
             fade_in(self._media, 260)
-        self._media_lbl.setPixmap(QPixmap.fromImage(img).scaled(
-            self._media_lbl.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self._media_lbl.set_frame(img)
         self._media_timer.start(6000)
 
     def show_media_frame(self, data: bytes, title: str = ""):
@@ -2182,9 +2282,8 @@ class MainWindow(QMainWindow):
             self._media.show()
             self.host.layout_floats()
         self._set_media_scene(True)
-        self._media.raise_()
-        self._media_lbl.setPixmap(QPixmap.fromImage(img.scaled(
-            self._media_lbl.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)))
+        self._front(self._media)
+        self._media_lbl.set_frame(img, smooth=False)
         self._media_timer.stop()  # video panel is closed by the player (empty frame) or the user, not by a timeout
 
     # ── mpv video: a native window floats over the media panel and mpv draws into it ──
@@ -2232,12 +2331,12 @@ class MainWindow(QMainWindow):
             if not self._media.isVisible():
                 self._media.show()
             self.host.layout_floats()
-            self._media.raise_()
+            self._front(self._media)
             self._set_media_scene(True)
             self._sync_mpv_geometry()
             vw.show()
             result["wid"] = int(vw.winId())
-            self._mpv_timer.start(100)
+            self._mpv_timer.start(250)
         except Exception as exc:
             result["error"] = str(exc)
         finally:
@@ -2451,6 +2550,10 @@ class MainWindow(QMainWindow):
         return True
 
     def _mpv_tick(self):
+        vw = self._mpv_win
+        want = 100 if (vw is not None and vw.isFullScreen()) else 250       # the full-screen bar follows the mouse; otherwise 4 Hz is plenty
+        if self._mpv_timer.interval() != want:                              # (the video window follows its panel at once, see layout_floats)
+            self._mpv_timer.setInterval(want)
         self._sync_mpv_geometry()
         self._vx_sync_overlay()
         self._update_mpv_bar()
