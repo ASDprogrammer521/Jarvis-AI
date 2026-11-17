@@ -1808,6 +1808,13 @@ class MainWindow(QMainWindow):
         self.backdrop.setEnabled(True)
         if self._lock_screen is not None:
             self._lock_screen.hide()
+        isl = self._modules.get("island")                # lock_jarvis hid it; bring the Dynamic Island back
+        if isl is not None:
+            try:
+                isl.show()
+                isl.lift()
+            except Exception:                            # noqa: BLE001 - a decoration must never break unlocking
+                pass
         if not self._lock_prev_muted and self._muted:
             self.toggle_mute()
         self._toast("🔓 Unlocked" + (" by face" if how == "face" else ""))

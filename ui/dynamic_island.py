@@ -309,7 +309,7 @@ class IslandBackend(QObject):
         v.setPosition(int(cx + self._dx - WIN_W / 2), int(top - M))
 
     def lift(self):
-        if self.view is not None:
+        if self.view is not None and self.view.isVisible():          # a hidden island (lock screen) must stay hidden
             force_topmost(self.view, click_through=False)
 
     def _menu(self, pinned: bool):
@@ -539,6 +539,7 @@ class QmlIsland:
 
     def __init__(self):
         self._fallback = None
+        self._held = False                                             # hide() was called: stay hidden until show()
         self.api = _configure_graphics()
         from PyQt6.QtQuick import QQuickView
         self.backend = IslandBackend()
@@ -578,21 +579,26 @@ class QmlIsland:
     def lift(self):
         if self._fallback is not None:
             return self._fallback.lift()
-        self.backend.lift()
+        if not self._held:
+            self.backend.lift()
 
     def isVisible(self) -> bool:
         return self._fallback.isVisible() if self._fallback is not None else self.view.isVisible()
 
     def hide(self):
-        """Hidden for now (the lock screen does this); the next lift() brings it back, exactly like the widget version."""
+        """Hidden for now (the lock screen does this); show() brings it back."""
         if self._fallback is not None:
             return self._fallback.hide()
+        self._held = True
         self.view.hide()
 
     def show(self):
         if self._fallback is not None:
             return self._fallback.show()
+        self._held = False
         self.view.show()
+        self.backend.place()
+        self.backend.lift()
 
     # ── trouble ──────────────────────────────────────────────────────────────────
     def _gfx_error(self, *_):

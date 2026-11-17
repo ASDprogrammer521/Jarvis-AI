@@ -1172,6 +1172,13 @@ class DashboardServer:
                 return FileResponse(str(path), media_type="text/html")
             return HTMLResponse("<h3>plugin_store.html missing</h3>", status_code=404)
 
+        @app.get("/cubing")
+        async def cubing_page():
+            path = STATIC_DIR / "cubing.html"
+            if path.exists():
+                return FileResponse(str(path), media_type="text/html")
+            return HTMLResponse("<h3>cubing.html missing</h3>", status_code=404)
+
         @app.get("/api/plugins")
         async def api_plugins_list(req: Request):
             if not _auth(req):
