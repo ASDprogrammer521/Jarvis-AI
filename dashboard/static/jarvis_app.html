@@ -302,13 +302,24 @@ function handlePhoneCmd(m) {
   }
   if (act === 'sms' && m.value) {
     const [n, ...rest] = String(m.value).split('|');
-    log('Jarvis drafted an SMS to ' + n);
-    try { location.href = 'sms:' + n.replace(/[^0-9+]/g, '') + '?body=' + encodeURIComponent(rest.join('|')); } catch (e) {}
+    const num = n.replace(/[^0-9+]/g, '');
+    if (!/^\+?[0-9]{3,20}$/.test(num)) { log('Blocked SMS: invalid phone number.'); return; }
+    log('Jarvis drafted an SMS to ' + num);
+    const a = document.createElement('a');
+    a.href = 'sms:' + num + '?body=' + encodeURIComponent(rest.join('|'));
+    a.rel = 'noopener noreferrer';
+    document.body.appendChild(a); a.click(); a.remove();
     return;
   }
   if (act === 'open_url' && m.url) {
-    log('Open URL: ' + m.url);
-    try { window.open(m.url, '_blank'); } catch (e) { location.href = m.url; }
+    let u = null;
+    try { u = new URL(String(m.url)); } catch (e) {}
+    if (!u || (u.protocol !== 'https:' && u.protocol !== 'http:')) {
+      log('Blocked URL (only http/https allowed).');
+      return;
+    }
+    log('Open URL: ' + u.href);
+    window.open(u.href, '_blank', 'noopener,noreferrer');
     return;
   }
   log('Phone cmd: ' + JSON.stringify(m));

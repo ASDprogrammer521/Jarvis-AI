@@ -29,3 +29,10 @@ function fmt(sec) {
     var s = sec % 60
     return Math.floor(sec / 60) + ":" + (s < 10 ? "0" : "") + s
 }
+
+// load colour for the hardware tiles: 0 = calm green, ~0.7 = amber, 1 = red
+function load(f) {
+    f = clamp(f, 0, 1)
+    if (f < 0.7) return mix("#30d158", "#ff9f0a", f / 0.7)
+    return mix("#ff9f0a", "#ff453a", (f - 0.7) / 0.3)
+}

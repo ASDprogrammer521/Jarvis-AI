@@ -8,7 +8,9 @@ only the pill inside it grows and shrinks.
 What it does (same as before, plus the event bubbles of Windhawk's Dynamic Island):
   · resting pill: time | weather, or cover + equaliser while music plays
   · hover / click / a new song: it springs open into the player (cover, title / artist / album, progress, ⏮ ⏯ ⏭), tinted with the cover
-  · the orange dot flips through the pages: player (while music is loaded) · calendar · clock + weather
+  · pages: player (while music is loaded) · calendar · clock + weather · hardware (CPU / RAM / GPU / temp / network / battery)
+  · flip pages with: the mouse wheel or two-finger touchpad scroll · the ‹ › buttons on both sides · the dots at the top
+    · a sideways swipe (drag) on the open card   (Shift+drag moves the island; a sideways drag on the closed pill moves it too)
   · pull it down to open it, up to shut it; sideways or Shift+drag moves it; right-click for the menu
   · short event bubbles: charger plugged / unplugged, low battery, "Copied" when something goes to the clipboard
 
@@ -132,6 +134,7 @@ class IslandBackend(QObject):
     noticeChanged = pyqtSignal()
     accentChanged = pyqtSignal()
     todayChanged = pyqtSignal()
+    systemChanged = pyqtSignal()
     calendarChanged = pyqtSignal()
     trackChanged = pyqtSignal()           # a new song started: the QML opens the card for a moment
     togglePin = pyqtSignal()              # menu → open / close
@@ -151,6 +154,9 @@ class IslandBackend(QObject):
         self._notice_id = 0
         self._today: dict = {}
         self._calendar: list = []
+        self._system: dict = {}
+        self._page = ""
+        self._t_sys = 0.0
         self._accent = QColor(C.PRI)
         self._accent_default = QColor(C.PRI)
         self.art_image: QImage | None = None
@@ -191,6 +197,10 @@ class IslandBackend(QObject):
     def today(self):
         return self._today
 
+    @pyqtProperty("QVariantMap", notify=systemChanged)
+    def system(self):
+        return self._system
+
     @pyqtProperty("QVariantList", notify=calendarChanged)
     def calendar(self):
         return self._calendar
@@ -202,6 +212,7 @@ class IslandBackend(QObject):
     # ── lifecycle ────────────────────────────────────────────────────────────────
     def start(self):
         self._timer.start()
+        self._pool.submit(self._read_system)                            # warm up the metrics thread (its first CPU reading is 0)
         if self._use_clip:
             try:
                 QGuiApplication.clipboard().dataChanged.connect(self._on_clip)
@@ -223,6 +234,13 @@ class IslandBackend(QObject):
         self._expanded = bool(on)
         if on:
             self._t_np = 0.0                                            # fresh progress as it opens
+
+    @pyqtSlot(str)
+    def setPage(self, name: str):
+        """The QML tells which page is showing; the hardware numbers are only polled while that page is open."""
+        self._page = str(name)
+        if self._page == "system":
+            self._t_sys = 0.0
 
     @pyqtSlot(result=QPointF)
     def cursor(self):
@@ -321,6 +339,9 @@ class IslandBackend(QObject):
         if "wx" not in self._jobs and now - self._t_wx >= (600.0 if self._weather else 60.0):
             self._t_wx = now
             self._jobs["wx"] = self._pool.submit(space_feeds.weather_json)
+        if self._expanded and self._page == "system" and "sys" not in self._jobs and now - self._t_sys >= 1.0:
+            self._t_sys = now
+            self._jobs["sys"] = self._pool.submit(self._read_system)
         if self._use_battery and "bat" not in self._jobs and now - self._t_bat >= 5.0:
             self._t_bat = now
             self._jobs["bat"] = self._pool.submit(self._read_battery)
@@ -347,6 +368,10 @@ class IslandBackend(QObject):
                 self._take_media(res, now)
             elif k == "bat" and res:
                 self._take_battery(res)
+            elif k == "sys" and isinstance(res, dict):
+                if res != self._system:
+                    self._system = res
+                    self.systemChanged.emit()
 
     @staticmethod
     def _read_battery():
@@ -356,6 +381,20 @@ class IslandBackend(QObject):
             return (int(b.percent), bool(b.power_plugged)) if b is not None else None
         except Exception:                                              # noqa: BLE001
             return None
+
+    @staticmethod
+    def _read_system() -> dict:
+        """CPU / RAM / GPU / temperature / network from ui.metrics, plus the battery. Missing sensors stay -1."""
+        out = {"cpu": 0.0, "mem": 0.0, "gpu": -1.0, "tmp": -1.0, "net": 0.0, "batt": -1, "plugged": False}
+        try:
+            from ui.metrics import _metrics
+            out.update(_metrics.snapshot())
+        except Exception:                                              # noqa: BLE001
+            pass
+        b = IslandBackend._read_battery()
+        if b:
+            out["batt"], out["plugged"] = b
+        return out
 
     def _take_battery(self, res):
         pct, plugged = res
@@ -463,13 +502,13 @@ class IslandBackend(QObject):
             self._art_url = ""
             if self.art_image is not None:
                 try:
-                    d = _icon_dir()
-                    for old_f in d.glob("art_*.png"):
+                    icon_dir = _icon_dir()
+                    for old_f in icon_dir.glob("art_*.png"):
                         try:
                             old_f.unlink()
                         except OSError:
                             pass
-                    p = d / f"art_{self._art_rev}.png"
+                    p = icon_dir / f"art_{self._art_rev}.png"
                     if self.art_image.save(str(p), "PNG"):
                         self._art_url = _file_url(p)
                 except Exception:                                      # noqa: BLE001

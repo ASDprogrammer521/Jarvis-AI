@@ -8,6 +8,7 @@
 //   notice    {active, icon, text}            a short event: battery, clipboard...
 //   today     {month, year, day, weekday, date}
 //   calendar  [{d, k}]   k = today | other | weekend | day
+//   system    {cpu, mem, gpu, tmp, net(MB/s), batt, plugged}   -1 = no sensor
 //   accent    colour of the cover
 import QtQuick
 import QtQuick.Effects
@@ -40,6 +41,7 @@ Item {
     readonly property var wx: backend.weather
     readonly property var nt: backend.notice
     readonly property var today: backend.today
+    readonly property var sy: backend.system
     readonly property bool music: md.music === true
     property color accent: backend.accent
     Behavior on accent { ColorAnimation { duration: 650; easing.type: Easing.InOutQuad } }
@@ -62,13 +64,14 @@ Item {
     property real pullT: 0
     property int page: 0
     readonly property bool hover: hh.hovered && !hoverBlock
-    readonly property var pages: music ? ["player", "calendar", "info"] : ["calendar", "info"]
-    readonly property string cur: pages[page % pages.length]
+    readonly property var pages: music ? ["player", "calendar", "info", "system"] : ["calendar", "info", "system"]
+    readonly property int pi: page % pages.length
+    readonly property string cur: pages[pi]
     readonly property bool expanded: pinned || hover || boost || leaving
     readonly property bool noticed: nt.active === true
     readonly property bool hasDays: wx.ok === true && wx.days !== undefined && wx.days.length > 0
     readonly property real restW: noticed ? 252 : baseW
-    readonly property real expH: cur === "player" ? 186 : (cur === "calendar" ? 168 : (hasDays ? 168 : 126))
+    readonly property real expH: cur === "player" ? 186 : ((cur === "calendar" || cur === "system") ? 168 : (hasDays ? 168 : 126))
 
     // where the pill wants to be …
     readonly property real tw: pulling ? restW + (openW - restW) * pullT : (expanded ? openW : restW)
@@ -98,6 +101,12 @@ Item {
         }
     }
     onExpandedChanged: backend.setExpanded(expanded)
+    onCurChanged: backend.setPage(cur)
+    // flip to the next (+1) or previous (-1) page
+    function go(dir) {
+        page = (pi + dir + pages.length) % pages.length
+        poke(3000)
+    }
     Timer { id: leaveTimer; interval: 450; onTriggered: root.leaving = false }
     Timer { id: boostTimer; interval: 4000; onTriggered: root.boost = false }
     function poke(ms) {
@@ -137,7 +146,7 @@ Item {
     onThChanged: { syncMask(); maskTimer.restart() }
     onPullingChanged: syncMask()
     Timer { id: maskTimer; interval: 900; onTriggered: root.syncMask() }
-    Component.onCompleted: { syncMask(); backend.setExpanded(false) }
+    Component.onCompleted: { syncMask(); backend.setExpanded(false); backend.setPage(cur) }
 
     // ── small reusable pieces ───────────────────────────────────────────────────
     component Lbl: Text {
@@ -278,6 +287,72 @@ Item {
         }
     }
 
+    // ‹ › page buttons on the two sides of the open card
+    component Chevron: Item {
+        id: cvr
+        property int dir: 1                 // 1 = points right (next), -1 = points left (previous)
+        property bool live: true
+        signal clicked()
+        width: 20
+        height: 44
+        opacity: cma.containsMouse ? 1 : 0.6
+        Behavior on opacity { NumberAnimation { duration: 140 } }
+        Rectangle {
+            anchors.centerIn: parent
+            width: 20; height: 20; radius: 10
+            scale: cma.pressed ? 0.85 : 1
+            Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutBack } }
+            color: cma.containsMouse ? Qt.rgba(1, 1, 1, 46 / 255) : Qt.rgba(1, 1, 1, 18 / 255)
+        }
+        Shape {
+            anchors.centerIn: parent
+            width: 12; height: 12
+            preferredRendererType: Shape.CurveRenderer
+            ShapePath {
+                strokeColor: "#ffffff"
+                strokeWidth: 1.8
+                fillColor: "transparent"
+                capStyle: ShapePath.RoundCap
+                joinStyle: ShapePath.RoundJoin
+                PathPolyline { path: [Qt.point(cvr.dir > 0 ? 4.5 : 7.5, 2.5), Qt.point(cvr.dir > 0 ? 8 : 4, 6), Qt.point(cvr.dir > 0 ? 4.5 : 7.5, 9.5)] }
+            }
+        }
+        MouseArea {
+            id: cma
+            anchors.fill: parent
+            enabled: cvr.live
+            hoverEnabled: true
+            onClicked: cvr.clicked()
+        }
+    }
+
+    // one hardware tile: label, big value, optional load bar
+    component Stat: Item {
+        id: st
+        property string label: ""
+        property string value: "—"
+        property real frac: -1              // 0..1 draws the bar, < 0 hides it
+        property color acc: "#30d158"
+        property color dim: "#6b74a6"
+        Rectangle {
+            anchors.fill: parent; radius: 14
+            color: Qt.rgba(1, 1, 1, 12 / 255)
+            border.width: 1; border.color: Qt.rgba(1, 1, 1, 20 / 255)
+        }
+        Lbl { x: 11; y: 6; width: parent.width - 22; height: 14; text: st.label; color: st.dim; font.pointSize: 7; font.weight: Font.DemiBold }
+        Lbl { x: 11; y: 20; width: parent.width - 22; height: 24; text: st.value; font.pointSize: 13; font.weight: Font.Bold; elide: Text.ElideRight }
+        Rectangle {
+            visible: st.frac >= 0
+            x: 11; y: parent.height - 13; width: parent.width - 22; height: 4; radius: 2
+            color: Qt.rgba(1, 1, 1, 34 / 255)
+            Rectangle {
+                width: Math.max(4, parent.width * Math.min(1, Math.max(0, st.frac))); height: parent.height; radius: 2
+                color: st.acc
+                Behavior on width { NumberAnimation { duration: 450; easing.type: Easing.OutCubic } }
+            }
+        }
+    }
+
     // a title that is too long for its box scrolls slowly, with a pause at both ends
     component Marquee: Item {
         id: mq
@@ -333,6 +408,27 @@ Item {
             id: hh
             onHoveredChanged: if (!hovered) root.hoverBlock = false
         }
+
+        // mouse wheel or two-finger touchpad scroll flips the pages (down / right = next)
+        WheelHandler {
+            id: wh
+            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            property real acc: 0
+            onWheel: (event) => {
+                if (!root.expanded || root.pulling) return
+                if (wheelCool.running) { wheelCool.restart(); return }   // still scrolling after a flip: wait for it to stop
+                var d = Math.abs(event.angleDelta.x) > Math.abs(event.angleDelta.y) ? -event.angleDelta.x : -event.angleDelta.y
+                acc += d
+                wheelIdle.restart()
+                if (Math.abs(acc) >= 100) {
+                    root.go(acc > 0 ? 1 : -1)
+                    acc = 0
+                    wheelCool.restart()
+                }
+            }
+        }
+        Timer { id: wheelIdle; interval: 220; onTriggered: wh.acc = 0 }
+        Timer { id: wheelCool; interval: 260 }
 
         // glass body
         Rectangle {
@@ -745,19 +841,101 @@ Item {
                     }
                 }
 
-                // the orange dot: next page
-                Rectangle {
-                    x: root.openW - 12 - 3.4; y: root.ch / 2 - 3.4
-                    width: 6.8; height: 6.8; radius: 3.4
-                    color: root.cDot
-                    scale: dotMa.pressed ? 1.5 : 1
-                    Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutBack } }
-                    MouseArea {
-                        id: dotMa
-                        x: -14; y: -19; width: 32; height: 44
-                        enabled: exp.live
-                        onClicked: { root.poke(3000); root.page = (root.page + 1) % root.pages.length }
+                // page: hardware monitor
+                Item {
+                    id: pgSys
+                    anchors.fill: parent
+                    opacity: root.cur === "system" ? 1 : 0
+                    visible: opacity > 0.01
+                    Behavior on opacity { NumberAnimation { duration: 220 } }
+                    transform: Translate { y: root.cur === "system" ? 0 : 8; Behavior on y { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } } }
+
+                    readonly property real tw_: (root.openW - 48 - 16) / 3
+                    readonly property real th_: 64
+                    readonly property var s_: root.sy
+                    readonly property bool hasCpu: s_.cpu !== undefined
+                    readonly property real net_: s_.net !== undefined ? s_.net : 0
+
+                    Stat {
+                        x: 24; y: 24; width: pgSys.tw_; height: pgSys.th_
+                        label: "CPU"; dim: root.cDim
+                        value: pgSys.hasCpu ? Math.round(pgSys.s_.cpu) + "%" : "—"
+                        frac: pgSys.hasCpu ? pgSys.s_.cpu / 100 : -1
+                        acc: U.load(frac)
                     }
+                    Stat {
+                        x: 24 + pgSys.tw_ + 8; y: 24; width: pgSys.tw_; height: pgSys.th_
+                        label: "RAM"; dim: root.cDim
+                        value: pgSys.hasCpu ? Math.round(pgSys.s_.mem) + "%" : "—"
+                        frac: pgSys.hasCpu ? pgSys.s_.mem / 100 : -1
+                        acc: U.load(frac)
+                    }
+                    Stat {
+                        x: 24 + (pgSys.tw_ + 8) * 2; y: 24; width: pgSys.tw_; height: pgSys.th_
+                        label: "GPU"; dim: root.cDim
+                        value: (pgSys.hasCpu && pgSys.s_.gpu >= 0) ? Math.round(pgSys.s_.gpu) + "%" : "N/A"
+                        frac: (pgSys.hasCpu && pgSys.s_.gpu >= 0) ? pgSys.s_.gpu / 100 : -1
+                        acc: U.load(frac)
+                    }
+                    Stat {
+                        x: 24; y: 24 + pgSys.th_ + 8; width: pgSys.tw_; height: pgSys.th_
+                        label: "TEMP"; dim: root.cDim
+                        value: (pgSys.hasCpu && pgSys.s_.tmp >= 0) ? Math.round(pgSys.s_.tmp) + "°C" : "N/A"
+                        frac: (pgSys.hasCpu && pgSys.s_.tmp >= 0) ? (pgSys.s_.tmp - 30) / 60 : -1
+                        acc: U.load(frac)
+                    }
+                    Stat {
+                        x: 24 + pgSys.tw_ + 8; y: 24 + pgSys.th_ + 8; width: pgSys.tw_; height: pgSys.th_
+                        label: "NETWORK"; dim: root.cDim
+                        value: !pgSys.hasCpu ? "—" : (pgSys.net_ >= 1 ? pgSys.net_.toFixed(1) + " MB/s" : Math.round(pgSys.net_ * 1024) + " KB/s")
+                        frac: -1
+                    }
+                    Stat {
+                        x: 24 + (pgSys.tw_ + 8) * 2; y: 24 + pgSys.th_ + 8; width: pgSys.tw_; height: pgSys.th_
+                        label: pgSys.hasCpu && pgSys.s_.plugged === true ? "BATTERY ⚡" : "BATTERY"; dim: root.cDim
+                        value: !pgSys.hasCpu ? "—" : (pgSys.s_.batt >= 0 ? pgSys.s_.batt + "%" : "AC")
+                        frac: (pgSys.hasCpu && pgSys.s_.batt >= 0) ? pgSys.s_.batt / 100 : -1
+                        acc: U.load(1 - Math.max(0, frac))
+                    }
+                }
+
+                // page dots at the top: the current one is long; click one to jump there
+                Row {
+                    id: dots
+                    y: 7
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 6
+                    Repeater {
+                        model: root.pages.length
+                        Rectangle {
+                            required property int index
+                            readonly property bool isCur: index === root.pi
+                            width: isCur ? 16 : 5; height: 5; radius: 2.5
+                            color: isCur ? "#ffffff" : Qt.rgba(1, 1, 1, 0.3)
+                            Behavior on width { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                            Behavior on color { ColorAnimation { duration: 180 } }
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -6
+                                enabled: exp.live
+                                onClicked: { root.page = parent.index; root.poke(3000) }
+                            }
+                        }
+                    }
+                }
+
+                // ‹ › buttons on both sides: previous / next page
+                Chevron {
+                    x: 0; y: root.ch / 2 - height / 2
+                    dir: -1
+                    live: exp.live
+                    onClicked: root.go(-1)
+                }
+                Chevron {
+                    x: root.openW - width; y: root.ch / 2 - height / 2
+                    dir: 1
+                    live: exp.live
+                    onClicked: root.go(1)
                 }
             }
         }
@@ -798,7 +976,10 @@ Item {
                 if (mode === "" && Math.abs(dx) + Math.abs(dy) > 6) {
                     var shift = (e.modifiers & Qt.ShiftModifier) !== 0
                     var side = Math.abs(dx) > Math.abs(dy) * 1.6
-                    mode = (shift || side) ? "move" : "pull"      // sideways or Shift: move · up / down: pull open / shut
+                    var open = root.expanded && root.cw > root.openW * 0.9
+                    if (shift) mode = "move"                       // Shift+drag always moves the island
+                    else if (side) mode = open ? "swipe" : "move"  // sideways: flip pages on the open card, move the closed pill
+                    else mode = "pull"                             // up / down: pull open / shut
                     if (mode === "pull" && !root.pinned) root.pulling = true
                 }
                 if (mode === "move") {
@@ -833,6 +1014,12 @@ Item {
                     return
                 }
                 if (md_ === "done") return
+                if (md_ === "swipe") {
+                    var c = backend.cursor()
+                    var sx = c.x - p0.x
+                    if (Math.abs(sx) > 40) root.go(sx < 0 ? 1 : -1)   // swipe left = next, right = previous
+                    return
+                }
                 if (md_ === "move") { backend.saveOffset(); return }
                 root.pinned = !root.pinned                          // a plain click
                 if (!root.pinned) { root.leaving = true; leaveTimer.restart() }
