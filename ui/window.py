@@ -2199,8 +2199,37 @@ class MainWindow(QMainWindow):
     def _cam_worker(self):
         """Camera preview: the frame is converted and shrunk to the panel's size here, in the worker, and handed over as a QImage
         (no JPEG encode + decode, no scaling on the GUI thread). A frame is only sent when the previous one has been shown."""
+        hub = None
         try:
             import cv2
+            try:
+                hub = self._camera_hub()                       # one camera for everything: hand tracking, face lock and this preview
+                hub.preview = True
+                hub.refresh()
+            except Exception:                                  # noqa: BLE001
+                hub = None
+            if hub is not None:
+                t0, last, started = time.time(), None, False
+                while self._cam_run:
+                    frame = hub.latest
+                    if frame is None or frame is last:
+                        if not started and not hub.running and time.time() - t0 > 3.0:
+                            raise RuntimeError(hub.status if str(hub.status).startswith(("error", "missing")) else "the camera did not start")
+                        time.sleep(0.02)
+                        continue
+                    last, started = frame, True
+                    if not self._cam_pending:
+                        tw, th = self._cam_px
+                        h, w = frame.shape[:2]
+                        k = min(tw / w, th / h, 1.0)
+                        if k < 0.98:
+                            frame = cv2.resize(frame, (max(1, int(w * k)), max(1, int(h * k))), interpolation=cv2.INTER_AREA)
+                            h, w = frame.shape[:2]
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        self._cam_pending = True
+                        self._cam_img_sig.emit(QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy())
+                    time.sleep(0.03)
+                return
             cap = cv2.VideoCapture(0)
             while self._cam_run and cap.isOpened():
                 ok, frame = cap.read()
@@ -2219,6 +2248,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log_sig.emit(f"ERR: camera — {e}")
             self._cam_run = False
+        finally:
+            if hub is not None:
+                hub.preview = False
+                hub.latest = None
+                try:
+                    hub.refresh()                              # releases the camera when nothing else needs it
+                except Exception:                              # noqa: BLE001
+                    pass
 
     def _camera_image(self, img):
         self._cam_pending = False

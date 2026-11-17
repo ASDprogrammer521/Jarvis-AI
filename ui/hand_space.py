@@ -605,6 +605,12 @@ class HandSpaceOverlay(QWidget):
                 self._want(c.data["image"], THUMB_SIDE, self._thumbs, 150)
         if op is not None and op.data.get("image") and op.k > 0.3:
             self._want(op.data["image"], LARGE_SIDE, self._large, 3)
+        live = {c.data.get("image") for c in sp.cards if c.data.get("image")}
+        if op is not None and op.data.get("image"):
+            live.add(op.data["image"])
+        for key, fut in list(self._jobs.items()):
+            if key[0] not in live and not fut.done() and fut.cancel():     # a page you already flipped past: don't decode it
+                del self._jobs[key]
         for key, fut in list(self._jobs.items()):
             if not fut.done():
                 continue

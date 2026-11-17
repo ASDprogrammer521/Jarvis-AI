@@ -12,6 +12,9 @@ import time
 
 from core import face_id, gesture, hand_cursor
 
+HAND_GAP_IDLE = 1 / 10     # no hand in view for HAND_IDLE_AFTER seconds: look for one only ~10 times a second (a hand shows up within 0.1 s)
+HAND_IDLE_AFTER = 2.0
+PREVIEW_GAP = 1 / 25      # the camera preview panel needs ~25 fps
 HAND_GAP_GESTURES = 1 / 15    # one-shot gestures only need ~15 fps; the hand mouse and Hand Space still use every frame
 FACE_EVERY = 0.4          # seconds between face checks while somebody is in view (gestures are checked on every frame)
 FACE_IDLE = 0.6           # …and while nobody is: only a quick search for a face, no recogniser
@@ -199,6 +202,9 @@ class CameraHub:
         self.on_hand = on_hand or (lambda pts, pinch: None)           # hand skeleton for the overlay
         self.on_space = on_space or (lambda hands: None)              # Hand Space: landmarks of every hand in view
         self.space = False                                            # set by the window while Hand Space is open
+        self.preview = False                                          # set while the camera preview panel is open: frames are shared, not opened twice
+        self.latest = None                                            # newest BGR frame, for the preview panel (read-only: never change it)
+        self._hand_seen = 0.0                                         # last time any hand was in view
         self.on_face = on_face
         self.on_status = on_status or (lambda s: None)
         self._stop = threading.Event()
@@ -247,7 +253,12 @@ class CameraHub:
         self.refresh()          # starts the camera if it was off
 
     def _wanted(self) -> bool:
-        return self._g or self._c or self.space or self._f or self._enroll is not None
+        return self._g or self._c or self.space or self._f or self.preview or self._enroll is not None
+
+    def _space_result(self, hands):
+        if hands:
+            self._hand_seen = time.time()
+        self.on_space(hands)
 
     def _set(self, s: str):
         self.status = s
@@ -280,6 +291,8 @@ class CameraHub:
         last_face = 0.0
         last_hand = 0.0
         _prof = [0.0, 0]
+        last_prev = 0.0
+        self._hand_seen = time.time()
         try:
             self._set("starting…")
             import cv2
@@ -294,7 +307,10 @@ class CameraHub:
                 t_now = time.time()
                 hands_on = self._g or self._c or self.space
                 hand_gap = 0.0 if (self._c or self.space) else HAND_GAP_GESTURES
+                if t_now - self._hand_seen > HAND_IDLE_AFTER:
+                    hand_gap = max(hand_gap, HAND_GAP_IDLE)                 # nobody is gesturing: keep the CPU for something else
                 hand_due = hands_on and t_now - last_hand >= hand_gap
+                preview_due = self.preview and t_now - last_prev >= PREVIEW_GAP
                 if self._enroll is not None or (not self.space and faceworker is not None and faceworker.present):
                     face_gap = FACE_EVERY
                 elif self.space:
@@ -304,7 +320,7 @@ class CameraHub:
                 face_due = ((self._f or self._enroll is not None) and t_now - last_face >= face_gap
                             and (faceworker is None or faceworker.ready()))
                 cleanup = (not hands_on and (hands is not None or cursor is not None)) or (not self._f and faceworker is not None and self._enroll is None)
-                if not (hand_due or face_due or cleanup):
+                if not (hand_due or face_due or cleanup or preview_due):
                     cap.grab()
                     time.sleep(0.008)
                     continue
@@ -313,9 +329,14 @@ class CameraHub:
                     time.sleep(0.03)
                     continue
                 now = time.time()
+                if self.preview:
+                    self.latest = frame
+                    last_prev = now
 
                 # ── hands: Hand Space (two hands) > cursor mode (hand = mouse) > one-shot gestures ──
-                if self._g or self._c or self.space:
+                if hands_on and not hand_due:
+                    pass                                   # this frame was read for the preview / face only: the hand models rest
+                elif self._g or self._c or self.space:
                     last_hand = now
                     need = 2 if self.space else 1
                     if hands is not None and getattr(hands, "num_hands", 1) != need:
@@ -337,7 +358,7 @@ class CameraHub:
                         if worker is None or worker.reader is not hands:
                             if worker is not None:
                                 worker.stop()
-                            worker = _HandWorker(hands, self.on_space)
+                            worker = _HandWorker(hands, self._space_result)
                             worker.start()
                         if worker.error is not None:
                             raise worker.error
@@ -353,6 +374,8 @@ class CameraHub:
                     else:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         lm = hands.detect(rgb)
+                        if lm:
+                            self._hand_seen = now
                         if self._c:
                             if cursor is None:
                                 cursor = hand_cursor.HandCursor(on_state=self.on_cursor, on_panic=self.on_cursor_panic, on_hand=self.on_hand)
@@ -400,6 +423,7 @@ class CameraHub:
                 name, self._enroll = self._enroll["name"], None
                 self.on_face("enroll_failed", f"{name}: {e}")
         finally:
+            self.latest = None
             if cap is not None:
                 cap.release()
             if cursor is not None:
