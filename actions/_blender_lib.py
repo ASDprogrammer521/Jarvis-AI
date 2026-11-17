@@ -9,6 +9,8 @@ from __future__ import annotations
 import fnmatch
 import math
 import os
+import random
+import re
 
 import bmesh
 import bpy
@@ -40,6 +42,18 @@ SHAPES
  jb.text(body, size=1.0, depth=0.1)            3D text; rot=(90,0,0) makes it stand upright facing the camera
  jb.ground(size=40, color="#8a8f98")           a big floor (ignored when the camera is framed)
  jb.group(name, children=(), loc=(0,0,0))      an empty that holds parts, so the whole thing can be moved / scaled together
+
+LOW-POLY CHARACTERS (use these for people, zombies, robots, monsters, animals' legs, spikes – they look far better than boxes)
+ jb.humanoid(name="Human", style="human"|"zombie"|"robot", pose="stand"|"zombie"|"tpose"|"walk"|"run"|"wave", height=1.75, build=1.0,
+             skin=None, shirt=None, pants=None, shoes=None, belt=None, eye_glow=None, hair=None, sleeves="short"|"long"|"none",
+             loc=(0,0,0), facing=0)
+     a complete faceted figure on the ground (head, jaw, nose, glowing eyes, torso, belt, arms, hands with fingers, legs, shoes)
+     returned as one group. Colours default from style; override any of them. Parts are named <name>_Head, <name>_ForeArmR ...
+     so jb.recolor("Zombie_Shirt*", "red") or jb.transform("Zombie_Head", rot=(0,0,20)) still work afterwards.
+ jb.limb(a, b, r1=0.05, r2=None, sides=6, squash=1.0, jitter=0.0)   tapered faceted prism from point a to point b (radius r1 -> r2):
+     arms, legs, necks, tails, horns, spikes, fingers, beaks. a and b are (x,y,z). Use r2=0.0... as a tiny number like 0.003 for a tip.
+ jb.blob(center, size=(rx,ry,rz), subdiv=1, jitter=0.0)             faceted ellipsoid: heads, hands, feet, rocks, fruit, joints
+ jb.showcase(bg="#2f4a3a", strength=0.8)    nice finished look: coloured background + key/fill/rim lights (call once at the END)
 
 MATERIALS
  jb.mat(name, color="gray", metallic=0, roughness=0.5, emission=None, emission_strength=3, alpha=1, glass=False, ior=1.45)
@@ -101,6 +115,59 @@ def _scene():
     return bpy.context.scene
 
 
+_EXTRA_COLOURS = {
+    "dough": "#d9a566", "bread": "#c98a4b", "frosting": "#ff8fb8", "icing": "#ff9ec4", "sprinkle": "#ffd23f",
+    "chocolate": "#4a2a17", "caramel": "#b7752e", "candy": "#ff5fa2", "cake": "#f2d09a", "cookie": "#c08a4a",
+    "strawberry": "#e8344f", "banana": "#f5d442", "apple": "#c8202f", "cherry": "#8b0a1e", "milk": "#f7f4ee",
+    "metal": "#9aa3ad", "chrome": "#d8dce0", "aluminum": "#c4c8cc", "aluminium": "#c4c8cc", "paint": "#c8c8c8",
+    "fabric": "#8a7f72", "leather": "#5b3a24", "paper": "#f1ead6", "bone": "#e6dfc8", "marble": "#e9e7e2",
+    "ceramic": "#ece8e0", "clay": "#b0643c", "mud": "#5a4632", "dirt": "#6b5239", "soil": "#5a4128", "flesh": "#e0ac84",
+    "fire": "#ff6a00", "flame": "#ff8a1c", "light": "#fff2c0", "dark": "#222222", "bark": "#5a3d28", "trunk": "#6b4a2e",
+    "pink": "#ff7fb0", "hotpink": "#ff4d94", "rose": "#e8588a", "peach": "#ffcba4", "salmon": "#fa8072",
+    "yellow": "#f2cf1d", "orange": "#f08a1c", "purple": "#7a3fb5", "violet": "#8a4fd0", "brown": "#7a4a28",
+    "blue": "#2a5ad6", "green": "#2f9e44", "red": "#d62828", "darkred": "#7a1010", "darkblue": "#15286b",
+    "lightblue": "#8cc4ee", "lightgreen": "#9be28a", "khaki": "#c3b37a", "amber": "#ffb000", "rust": "#a64a1f",
+}
+
+
+def _guess_colour(word) -> str:
+    """Hex (no #) for an unknown colour word: known names inside it, then the closest spelling, otherwise neutral grey."""
+    key = "".join(ch for ch in str(word).lower() if ch.isalnum())
+    table = {**_EXTRA_COLOURS, **{k: v for k, v in NAMED.items()}}
+    if key in table:
+        return table[key].lstrip("#")[:6]
+    hits = [k for k in table if len(k) >= 3 and (k in key or key in k)]
+    if hits:
+        return table[max(hits, key=len)].lstrip("#")[:6]
+    import difflib
+    close = difflib.get_close_matches(key, list(table), n=1, cutoff=0.6)
+    return (table[close[0]] if close else "#8a8a8a").lstrip("#")[:6]
+
+
+_OBJ_REPR = re.compile(r"""objects\s*(?:\[\s*|\.get\(\s*)['"](.+?)['"]""")
+_OBJ_REPR2 = re.compile(r"""Object\(\s*['"](.+?)['"]""")
+
+
+def _name_of(spec):
+    """Strip things like "bpy.data.objects['Frosting']" or "<bpy_struct, Object("Frosting")>" down to the plain name."""
+    if not isinstance(spec, str):
+        return spec
+    for rx in (_OBJ_REPR, _OBJ_REPR2):
+        m = rx.search(spec)
+        if m:
+            return m.group(1)
+    return spec.strip()
+
+
+def _ob(x):
+    """Accept an object, a name (also in bpy.data.objects['X'] form) or a one-item list and return the Blender object."""
+    if isinstance(x, (list, tuple)) and len(x) == 1:
+        x = x[0]
+    if isinstance(x, str):
+        return find(x)[0]
+    return x
+
+
 def _lin(v: float) -> float:
     return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
 
@@ -120,7 +187,9 @@ def col(c, alpha: float = 1.0):
             rgb = [int(key[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
             a = int(key[6:8], 16) / 255.0 if len(key) == 8 else alpha
         except ValueError:
-            raise ValueError(f"unknown colour {c!r}: use a name like 'red', '#ff8800' or (r,g,b)") from None
+            guess = _guess_colour(c)                                    # never fail a whole model over a colour word
+            rgb = [int(guess[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+            a = alpha
     else:
         vals = [float(x) for x in c]
         if len(vals) < 3:
@@ -246,6 +315,7 @@ def _auto_mat(color, metallic, roughness):
 
 
 def assign(ob, material):
+    ob = _ob(ob)
     if isinstance(material, str):
         found = bpy.data.materials.get(material)
         if found is None:
@@ -266,6 +336,7 @@ def _min_z(ob) -> float:
 
 
 def _parent(ob, parent):
+    ob, parent = _ob(ob), _ob(parent)
     _update()
     ob.parent = parent
     ob.matrix_parent_inverse = parent.matrix_world.inverted()
@@ -481,6 +552,172 @@ def group(name="Group", children=(), loc=(0, 0, 0)):
     return g
 
 
+# ---------------------------------------------------------------- low-poly characters
+
+def limb(a, b, r1=0.05, r2=None, sides=6, squash=1.0, jitter=0.0, caps=True, seed=0, name="Limb", smooth=False, **kw):
+    """A tapered faceted prism from point a to point b (radius r1 at a, r2 at b): arms, legs, torso, neck, fingers, horns, spikes."""
+    A, B = Vector(_v3(a)), Vector(_v3(b))
+    axis = B - A
+    if axis.length < 1e-6:
+        raise ValueError("limb: the two end points are the same")
+    d = axis.normalized()
+    ref = Vector((1, 0, 0)) if abs(d.z) > 0.9 else Vector((0, 0, 1))
+    u = d.cross(ref).normalized()
+    w = d.cross(u).normalized()
+    r1 = float(r1)
+    r2 = r1 if r2 is None else float(r2)
+    n = max(3, int(sides))
+    rng = random.Random(int(seed))
+    verts = []
+    for centre, r in ((A, r1), (B, r2)):
+        for i in range(n):
+            t = 2 * math.pi * i / n + math.pi / n
+            k = 1.0 + (rng.uniform(-jitter, jitter) if jitter else 0.0)
+            p = centre + u * (math.cos(t) * r * k * float(squash)) + w * (math.sin(t) * r * k)
+            if jitter:
+                p = p + d * rng.uniform(-jitter, jitter) * max(r1, r2)
+            verts.append(tuple(p))
+    faces = [[i, (i + 1) % n, n + (i + 1) % n, n + i] for i in range(n)]
+    if caps:
+        faces.append(list(range(n - 1, -1, -1)))
+        faces.append([n + i for i in range(n)])
+    return _place(_pydata_obj(name, verts, faces), name=name, smooth=smooth, **kw)
+
+
+def blob(center=(0, 0, 0), size=(0.1, 0.1, 0.1), subdiv=1, jitter=0.0, seed=0, name="Blob", **kw):
+    """A faceted rock-like ellipsoid with half-sizes `size` around `center`: heads, hands, feet, joints, stones, fruit."""
+    ob = ico(r=1.0, subdiv=max(1, int(subdiv)), name=name, smooth=False, scale=_v3(size, 1.0), **kw)
+    if jitter:
+        rng = random.Random(int(seed))
+        for v in ob.data.vertices:
+            v.co = v.co * (1.0 + rng.uniform(-jitter, jitter))
+    ob.location = _v3(center)
+    return ob
+
+
+_STYLES = {
+    "zombie": dict(skin="#7f9c52", shirt="#6f8548", pants="#6a4a2c", shoes="#2a2118", belt="#241a12", eye_glow="#ff9a1a", hair=None),
+    "human": dict(skin="#e0ac84", shirt="#3a6ea5", pants="#2f3b52", shoes="#222222", belt="#1c1c1c", eye_glow=None, hair="#3b2a1a"),
+    "robot": dict(skin="#aab2bb", shirt="#7d8791", pants="#5d6670", shoes="#2e3338", belt="#ffb000", eye_glow="#38d6ff", hair=None),
+}
+
+_L, _R = -1, 1
+
+
+def _pose_table():
+    # (out, forward, up) direction of each segment; "out" points away from the body, "forward" is the way the figure faces.
+    stand_arm = ((0.12, 0.0, -1.0), (0.05, 0.12, -1.0))
+    stand_leg = ((0.04, 0.0, -1.0), (0.0, 0.0, -1.0))
+    return {
+        "stand": {"arm": {_R: stand_arm, _L: stand_arm}, "leg": {_R: stand_leg, _L: stand_leg}},
+        "tpose": {"arm": {_R: ((1, 0, 0), (1, 0, 0)), _L: ((1, 0, 0), (1, 0, 0))}, "leg": {_R: stand_leg, _L: stand_leg}},
+        "zombie": {"arm": {_R: ((0.22, 0.85, -0.45), (0.08, 1.0, 0.05)), _L: ((0.22, 0.85, -0.45), (0.08, 1.0, 0.08))},
+                   "leg": {_R: ((0.05, 0.28, -1.0), (0.0, -0.08, -1.0)), _L: ((0.05, -0.18, -1.0), (0.0, -0.3, -1.0))}},
+        "walk": {"arm": {_R: ((0.1, -0.35, -1.0), (0.05, -0.2, -1.0)), _L: ((0.1, 0.45, -1.0), (0.05, 0.6, -0.8))},
+                 "leg": {_R: ((0.0, 0.45, -1.0), (0.0, 0.05, -1.0)), _L: ((0.0, -0.4, -1.0), (0.0, -0.55, -0.95))}},
+        "wave": {"arm": {_R: ((0.7, 0.0, 0.7), (0.2, 0.0, 1.0)), _L: stand_arm}, "leg": {_R: stand_leg, _L: stand_leg}},
+        "run": {"arm": {_R: ((0.1, -0.7, -0.6), (0.0, 0.5, -0.9)), _L: ((0.1, 0.8, -0.5), (0.0, 0.9, 0.3))},
+                "leg": {_R: ((0.0, 0.8, -0.7), (0.0, 0.1, -1.0)), _L: ((0.0, -0.6, -0.8), (0.0, -1.0, -0.4))}},
+    }
+
+
+def humanoid(name="Human", style="human", pose="stand", height=1.75, build=1.0, skin=None, shirt=None, pants=None, shoes=None,
+             belt=None, eye_glow=None, hair=None, sleeves="short", jitter=0.04, seed=3, loc=(0, 0, 0), facing=0.0):
+    """A complete low-poly person standing on z=0, made of faceted tapered parts and returned as one group.
+
+    style : "human" | "zombie" | "robot" (sets the colours; every colour can still be overridden)
+    pose  : "stand" | "zombie" (arms out front, shuffling) | "tpose" | "walk" | "run" | "wave"
+    height: metres.  build: 1.0 normal, 1.2 broad, 0.85 thin.  sleeves: "short" | "long" | "none".
+    The figure faces -Y (towards the default camera). facing=180 turns it round. Parts are named <name>_Head, <name>_Torso ...
+    """
+    st = _STYLES.get(str(style).lower(), _STYLES["human"])
+    skin_c, shirt_c, pants_c = skin or st["skin"], shirt or st["shirt"], pants or st["pants"]
+    shoe_c, belt_c = shoes or st["shoes"], belt or st["belt"]
+    glow = eye_glow if eye_glow is not None else st["eye_glow"]
+    hair_c = hair if hair is not None else st["hair"]
+    robot = str(style).lower() == "robot"
+    metal = 0.8 if robot else 0.0
+    s, b = float(height) / 1.75, float(build)
+    table = _pose_table()
+    pz = table.get(str(pose).lower(), table["stand"])
+
+    m_skin = mat(f"{name}_Skin", color=skin_c, metallic=metal, roughness=0.35 if robot else 0.85)
+    m_shirt = mat(f"{name}_Shirt", color=shirt_c, metallic=metal * 0.6, roughness=0.5 if robot else 0.9)
+    m_pants = mat(f"{name}_Pants", color=pants_c, metallic=metal * 0.6, roughness=0.5 if robot else 0.9)
+    m_shoe = mat(f"{name}_Shoes", color=shoe_c, roughness=0.7)
+    m_belt = mat(f"{name}_Belt", color=belt_c, metallic=0.5, roughness=0.4)
+    parts = []
+
+    def add(o):
+        parts.append(o)
+        return o
+
+    def unit(v, side):
+        out, fwd, up = v
+        return Vector((side * out, -fwd, up)).normalized()
+
+    j = float(jitter)
+    # torso, hips, belt, neck, head
+    add(limb((0, 0, 0.93 * s), (0, 0, 1.44 * s), 0.150 * s * b, 0.195 * s * b, sides=8, squash=0.62, jitter=j, seed=seed, name=f"{name}_Torso", material=m_shirt))
+    add(limb((0, 0, 0.84 * s), (0, 0, 0.98 * s), 0.160 * s * b, 0.150 * s * b, sides=8, squash=0.66, jitter=j, seed=seed + 1, name=f"{name}_Hips", material=m_pants))
+    add(limb((0, 0, 0.935 * s), (0, 0, 0.985 * s), 0.168 * s * b, 0.168 * s * b, sides=8, squash=0.67, name=f"{name}_Belt", material=m_belt))
+    add(limb((0, 0, 1.43 * s), (0, 0, 1.57 * s), 0.052 * s, 0.045 * s, sides=6, name=f"{name}_Neck", material=m_skin))
+    add(blob((0, 0, 1.67 * s), (0.100 * s, 0.112 * s, 0.128 * s), 1, j * 1.5, seed + 2, f"{name}_Head", material=m_skin))
+    add(blob((0, -0.025 * s, 1.60 * s), (0.068 * s, 0.075 * s, 0.055 * s), 1, j, seed + 3, f"{name}_Jaw", material=m_skin))
+    add(blob((0, -0.112 * s, 1.655 * s), (0.016 * s, 0.026 * s, 0.032 * s), 0, 0, 0, f"{name}_Nose", material=m_skin))
+    if hair_c:
+        add(blob((0, 0.012 * s, 1.735 * s), (0.106 * s, 0.116 * s, 0.07 * s), 1, j, seed + 4, f"{name}_Hair", color=hair_c, roughness=0.9))
+    m_eye = mat(f"{name}_Eye", color=glow or "#141414", emission=glow, emission_strength=8.0, roughness=0.4) if glow else mat(f"{name}_Eye", color="#141414", roughness=0.3)
+    for sd, tag in ((_R, "R"), (_L, "L")):
+        add(blob((sd * 0.042 * s, -0.098 * s, 1.685 * s), (0.017 * s, 0.012 * s, 0.014 * s), 0, 0, 0, f"{name}_Eye{tag}", material=m_eye))
+
+    # arms
+    for sd, tag in ((_R, "R"), (_L, "L")):
+        sh = Vector((sd * 0.215 * s * b, 0, 1.455 * s))
+        up_dir, fo_dir = pz["arm"][sd]
+        el = sh + unit(up_dir, sd) * 0.30 * s
+        wr = el + unit(fo_dir, sd) * 0.27 * s
+        sleeve_m = m_skin if sleeves == "none" else m_shirt
+        fore_m = m_shirt if sleeves == "long" else m_skin
+        add(blob(tuple(sh), (0.062 * s * b,) * 3, 1, j, seed + 5, f"{name}_Shoulder{tag}", material=sleeve_m))
+        add(limb(sh, el, 0.052 * s * b, 0.042 * s * b, sides=6, jitter=j, seed=seed + 6, name=f"{name}_UpperArm{tag}", material=sleeve_m))
+        add(limb(el, wr, 0.042 * s * b, 0.032 * s * b, sides=6, jitter=j, seed=seed + 7, name=f"{name}_ForeArm{tag}", material=fore_m))
+        d = (wr - el).normalized()
+        hand = wr + d * 0.045 * s
+        add(blob(tuple(hand), (0.034 * s, 0.034 * s, 0.05 * s), 1, j, seed + 8, f"{name}_Hand{tag}", material=m_skin))
+        side_v = d.cross(Vector((0, 0, 1)))
+        side_v = side_v.normalized() if side_v.length > 1e-4 else Vector((1, 0, 0))
+        for k in (-1, 0, 1):
+            base = hand + side_v * (k * 0.02 * s) + d * 0.02 * s
+            add(limb(tuple(base), tuple(base + d * 0.075 * s), 0.014 * s, 0.006 * s, sides=4, name=f"{name}_Finger{tag}{k + 2}", material=m_skin))
+
+    # legs
+    for sd, tag in ((_R, "R"), (_L, "L")):
+        hp = Vector((sd * 0.100 * s * b, 0, 0.92 * s))
+        th_dir, sh_dir = pz["leg"][sd]
+        kn = hp + unit(th_dir, sd) * 0.45 * s
+        an = kn + unit(sh_dir, sd) * 0.43 * s
+        add(limb(hp, kn, 0.078 * s * b, 0.058 * s * b, sides=7, jitter=j, seed=seed + 9, name=f"{name}_Thigh{tag}", material=m_pants))
+        add(blob(tuple(kn), (0.062 * s * b,) * 3, 1, j, seed + 10, f"{name}_Knee{tag}", material=m_pants))
+        add(limb(kn, an, 0.058 * s * b, 0.040 * s * b, sides=7, jitter=j, seed=seed + 11, name=f"{name}_Shin{tag}", material=m_pants))
+        add(blob((an.x, an.y - 0.055 * s, an.z - 0.04 * s), (0.052 * s * b, 0.115 * s, 0.045 * s), 1, j, seed + 12, f"{name}_Foot{tag}", material=m_shoe))
+
+    low = min(_min_z(o) for o in parts)
+    for o in parts:
+        o.location.z -= low
+    g = group(name, parts)
+    g.location = _v3(loc)
+    g.rotation_euler.z = math.radians(float(facing))
+    return g
+
+
+def showcase(bg="#2f4a3a", strength=0.8, light=1.0):
+    """Studio look for a finished model: a solid coloured background and key / fill / rim lights framed to the model."""
+    sky(bg, strength)
+    studio(light)
+    return True
+
+
 # ---------------------------------------------------------------- modifiers
 
 def _modify(ob, kind, label, **props):
@@ -502,11 +739,13 @@ def _apply_mod(ob, mod) -> bool:
 
 
 def bevel(ob, width=0.02, segments=3, angle=30):
+    ob = _ob(ob)
     _modify(ob, "BEVEL", "Bevel", width=float(width), segments=int(segments), limit_method="ANGLE", angle_limit=math.radians(angle))
     return ob
 
 
 def subsurf(ob, levels=2, render_levels=None):
+    ob = _ob(ob)
     _modify(ob, "SUBSURF", "Subsurf", levels=int(levels), render_levels=int(render_levels if render_levels is not None else levels))
     if ob.type == "MESH":
         _smooth_polys(ob, True)
@@ -514,6 +753,7 @@ def subsurf(ob, levels=2, render_levels=None):
 
 
 def array(ob, count=3, offset=(1, 0, 0), relative=False):
+    ob = _ob(ob)
     m = _modify(ob, "ARRAY", "Array", count=int(count))
     if relative:
         m.use_relative_offset = True
@@ -527,6 +767,7 @@ def array(ob, count=3, offset=(1, 0, 0), relative=False):
 
 
 def mirror(ob, axis="X", merge=True):
+    ob = _ob(ob)
     m = _modify(ob, "MIRROR", "Mirror", use_mirror_merge=bool(merge))
     ax = str(axis).upper()
     m.use_axis = (("X" in ax), ("Y" in ax), ("Z" in ax))
@@ -534,11 +775,13 @@ def mirror(ob, axis="X", merge=True):
 
 
 def solidify(ob, thickness=0.05, offset=-1):
+    ob = _ob(ob)
     _modify(ob, "SOLIDIFY", "Solidify", thickness=float(thickness), offset=float(offset))
     return ob
 
 
 def boolean(ob, other, op="DIFFERENCE", apply=True, hide_other=True):
+    ob, other = _ob(ob), _ob(other)
     m = _modify(ob, "BOOLEAN", "Boolean", object=other, operation=str(op).upper())
     try:
         m.solver = "EXACT"
@@ -553,12 +796,14 @@ def boolean(ob, other, op="DIFFERENCE", apply=True, hide_other=True):
 
 
 def apply_modifiers(ob):
+    ob = _ob(ob)
     for m in list(ob.modifiers):
         _apply_mod(ob, m)
     return ob
 
 
 def join(objs, name="Merged"):
+    objs = [_ob(o) for o in (objs if isinstance(objs, (list, tuple)) else [objs])]
     objs = [o for o in objs if o.type == "MESH"]
     if len(objs) < 2:
         return objs[0] if objs else None
@@ -576,6 +821,7 @@ def join(objs, name="Merged"):
 # ---------------------------------------------------------------- copies
 
 def duplicate(ob, name=None, linked=False, **kw):
+    ob = _ob(ob)
     new = ob.copy()
     if getattr(ob, "data", None) is not None and not linked:
         new.data = ob.data.copy()
@@ -584,6 +830,7 @@ def duplicate(ob, name=None, linked=False, **kw):
 
 
 def ring(ob, count=8, radius=1.0, center=(0, 0, 0), face_out=True):
+    ob = _ob(ob)
     """Spread `count` objects on a circle: the original takes the first slot, copies fill the rest. Returns all of them."""
     cx, cy, cz = _v3(center)
     n = max(1, int(count))
@@ -601,6 +848,7 @@ def ring(ob, count=8, radius=1.0, center=(0, 0, 0), face_out=True):
 
 
 def grid(ob, nx=3, ny=3, dx=1.0, dy=1.0):
+    ob = _ob(ob)
     """nx * ny objects on a grid that starts at the object's own position (the original is the first cell)."""
     x0, y0, z0 = ob.location.x, ob.location.y, ob.location.z
     out = [ob]
@@ -621,7 +869,12 @@ def _is_geometry(o) -> bool:
 def find(spec):
     objs = list(_scene().objects)
     if isinstance(spec, (list, tuple, set)):
-        names = list(spec)
+        names = [_name_of(n) for n in spec]
+    elif isinstance(spec, str):
+        spec = _name_of(spec)
+        names = [spec] if spec in bpy.data.objects.keys() else [s.strip() for s in str(spec).split(",") if s.strip()]
+    elif hasattr(spec, "name") and hasattr(spec, "type"):               # a Blender object
+        names = [spec]
     else:
         names = [s.strip() for s in str(spec).split(",") if s.strip()]
     if not names or (len(names) == 1 and isinstance(names[0], str) and names[0].lower() in ("all", "*", "everything")):

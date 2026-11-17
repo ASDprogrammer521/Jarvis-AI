@@ -257,7 +257,9 @@ _RULES = """You are Jarvis' Blender modeller. You write a short Python script th
 
 OUTPUT: only Python code. No explanations, no markdown fences.
 ALREADY AVAILABLE (do not import them): jb, bpy, bmesh, math, random, Vector, Euler, Matrix. Importing anything else (os, sys, subprocess…) or calling open() is forbidden and the script will be rejected.
-Build with jb helpers. Do not call bpy.ops.* (render/wm/script are blocked) and do not add lights, a camera, a world, rendering or saving: Jarvis does all of that.
+Build with jb helpers. ALWAYS keep the object that every jb shape returns in a Python variable and pass THAT VARIABLE on (jb.bevel(top, 0.01), parent=table, jb.boolean(a, b)). Never write object names as code inside a string such as "bpy.data.objects['X']", and never use bpy.data.objects[...] at all. Use only the colour names from the API reference or "#rrggbb" hex codes.
+Organic things (donut, fruit, rocket, animal, character) are built from jb.torus / jb.sphere / jb.lathe / jb.cone / jb.cylinder, scaled and combined; keep them simple, 5-15 parts.
+Do not call bpy.ops.* (render/wm/script are blocked) and do not add a camera, rendering or saving: Jarvis does that. Lights and background are automatic too; the only exception is that for a finished character or showpiece you may end the script with jb.showcase("#rrggbb") to give it a coloured studio backdrop.
 
 QUALITY – make it look like a real, recognisable, good-looking model, not a pile of boxes:
  • real-world proportions in metres (person ≈ 1.75 m, door ≈ 2 m, chair seat ≈ 0.45 m), standing on the ground at z = 0 (use bottom=0 for the lowest parts).
@@ -265,6 +267,10 @@ QUALITY – make it look like a real, recognisable, good-looking model, not a pi
  • believable colours and materials (jb.mat for metal, glass, wood, glowing parts), not everything the same grey.
  • use loops, jb.array, jb.ring, jb.grid, jb.mirror for repetition; wrap the whole model in jb.group("Name") and pass parent=… so it can be moved as one.
  • keep it light: at most ~300 objects and a few thousand vertices per shape; it must run in well under 30 seconds.
+
+CHARACTERS AND CREATURES: for any person, zombie, soldier, robot, humanoid monster or NPC call jb.humanoid(...) first (it makes a complete faceted low-poly figure), then adjust parts by name or add props with jb.limb / jb.blob (hat, sword, backpack, wings, horns, tail, spikes). For animals and other creatures build the body with jb.blob and the legs, neck, tail and horns with jb.limb. These faceted, flat-shaded parts give the modern low-poly look; do not build characters out of plain boxes.
+LOW-POLY STYLE: few sides (5-8), flat shading (smooth=False), a small jitter for a hand-made look, two or three well-chosen colours per object, one glowing accent (emission) where it suits.
+If a reference image is attached, copy its subject, proportions, colour palette and art style as closely as the jb helpers allow.
 
 MODES
  • create: the scene is empty. Add jb.ground() only when the subject naturally stands on a floor.
@@ -276,6 +282,22 @@ jb.bevel(top, 0.01)
 table = jb.group("Table", [top])
 for i, (x, y) in enumerate([(-0.72, -0.38), (0.72, -0.38), (-0.72, 0.38), (0.72, 0.38)]):
     jb.cylinder(r=0.04, h=0.72, name=f"Leg{i+1}", loc=(x, y, 0), bottom=0, color="darkwood", parent=table)
+
+EXAMPLE (create "a low-poly zombie with glowing orange eyes"):
+z = jb.humanoid("Zombie", style="zombie", pose="zombie", height=1.8)
+jb.recolor("Zombie_Shirt*", "#5b7a3a")
+jb.showcase("#2f4a3a")
+
+EXAMPLE (create "a low-poly christmas tree with a gold star and baubles"):
+trunk = jb.cylinder(r=0.14, h=0.5, verts=8, name="Trunk", color="darkwood", bottom=0, smooth=False)
+tree = jb.group("Tree", [trunk])
+for i, (r, h, z) in enumerate([(1.25, 1.0, 0.45), (1.0, 0.95, 1.1), (0.75, 0.85, 1.7), (0.5, 0.75, 2.25)]):
+    jb.cone(r1=r, r2=0.0, h=h, verts=8, name=f"Layer{i+1}", color="darkgreen", bottom=z, smooth=False, parent=tree)
+pts = [(math.cos(math.radians(90 + a * 36)) * (0.22 if a % 2 == 0 else 0.1), math.sin(math.radians(90 + a * 36)) * (0.22 if a % 2 == 0 else 0.1)) for a in range(10)]
+jb.extrude_poly(pts, depth=0.06, name="Star", color="gold", metallic=0.9, roughness=0.3, rot=(90, 0, 0), loc=(0, 0.03, 3.1), parent=tree)
+b = jb.sphere(r=0.07, segments=12, rings=8, name="Bauble", color="red", metallic=0.6, roughness=0.25, loc=(0.85, 0, 0.9))
+jb.ring(b, count=7, radius=0.85, center=(0, 0, 0.9), face_out=False)
+jb.showcase("#1f2f4a")
 
 EXAMPLE (edit "make the roof red and add a chimney"):
 jb.recolor("Roof*", "red")
@@ -291,7 +313,22 @@ def _extract_code(text: str) -> str:
     return re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
 
 
-def _ask_llm(request: str, mode: str, scene: list | None, previous: str = "", error: str = "") -> str:
+def _image_part(path):
+    """A reference image for Gemini, or None when it can't be read."""
+    try:
+        f = Path(str(path or "").strip().strip('"')).expanduser()
+        if not f.is_file():
+            return None
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}.get(f.suffix.lower())
+        if mime is None or f.stat().st_size > 15_000_000:
+            return None
+        from google.genai import types
+        return types.Part.from_bytes(data=f.read_bytes(), mime_type=mime)
+    except Exception:                                                      # noqa: BLE001
+        return None
+
+
+def _ask_llm(request: str, mode: str, scene: list | None, previous: str = "", error: str = "", image=None) -> str:
     from core import gemini
     parts = [_RULES, "API REFERENCE\n" + _api_reference(), f"MODE: {mode}"]
     if mode == "edit":
@@ -300,14 +337,17 @@ def _ask_llm(request: str, mode: str, scene: list | None, previous: str = "", er
     if previous and error:
         parts.append("YOUR PREVIOUS SCRIPT FAILED.\n--- script ---\n" + previous[-9000:] + "\n--- error ---\n" + error[-1500:] +
                      "\nFix it and return the complete corrected script.")
-    return _extract_code(gemini.text("\n\n".join(parts), tier=gemini.SMART, timeout_ms=120_000))
+    prompt = "\n\n".join(parts)
+    part = _image_part(image) if image else None
+    contents = [part, "A reference image is attached: model what it shows.\n\n" + prompt] if part is not None else prompt
+    return _extract_code(gemini.text(contents, tier=gemini.SMART, timeout_ms=120_000))
 
 
-def _generate_and_run(request: str, mode: str, paths: dict, scene: list | None, new: bool, player=None) -> tuple[dict, str]:
+def _generate_and_run(request: str, mode: str, paths: dict, scene: list | None, new: bool, player=None, image=None) -> tuple[dict, str]:
     """AI writes the script, Blender runs it, errors go back to the AI. Returns (result, last_error)."""
     code, error, short = "", "", ""
     for attempt in range(1, _MAX_ATTEMPTS + 1):
-        code = _ask_llm(request, mode, scene, previous=code, error=error)
+        code = _ask_llm(request, mode, scene, previous=code, error=error, image=image)
         if not code:
             return {"ok": False}, "the AI model returned nothing (check the Gemini key / connection)"
         bad = check_code(code)
@@ -429,7 +469,7 @@ def _create(p: dict, player=None) -> str:
     paths = _paths(name)
     paths["dir"].mkdir(parents=True, exist_ok=True)
     log(f"[Blender] building '{prompt[:60]}' …", player)
-    res, err = _generate_and_run(prompt, "create", paths, None, new=True, player=player)
+    res, err = _generate_and_run(prompt, "create", paths, None, new=True, player=player, image=p.get("image"))
     if not res.get("ok"):
         if not paths["blend"].is_file():
             shutil.rmtree(paths["dir"], ignore_errors=True)
@@ -451,7 +491,7 @@ def _edit(p: dict, player=None) -> str:
     if not inspect.get("ok"):
         return f"I couldn't read the project: {inspect.get('error', 'unknown error')}"
     log(f"[Blender] editing '{paths['name']}': {prompt[:60]} …", player)
-    res, err = _generate_and_run(prompt, "edit", paths, inspect.get("summary") or [], new=False, player=player)
+    res, err = _generate_and_run(prompt, "edit", paths, inspect.get("summary") or [], new=False, player=player, image=p.get("image"))
     if not res.get("ok"):
         return _NO_BLENDER if err == "NO_BLENDER" else f"I couldn't make that change after {_MAX_ATTEMPTS} tries, sir (the project is unchanged): {err}"
     return _finish(p, paths, "Done —", res, player)
@@ -706,6 +746,7 @@ TOOL = {
             "action": {"type": "STRING", "description": "create | edit | color | transform | delete | lighting | background | render | export | import | open | undo | list | projects | switch | new | status"},
             "prompt": {"type": "STRING", "description": "create/edit: what to build or change, e.g. 'a low-poly pine tree with snow' or 'add a red door and make the walls white'"},
             "name": {"type": "STRING", "description": "project name for create/new/switch (optional)"},
+            "image": {"type": "STRING", "description": "create/edit: full path of a reference image (png/jpg/webp) to model after, e.g. a screenshot or a picture the user sent (optional)"},
             "project": {"type": "STRING", "description": "work on this project instead of the current one (optional)"},
             "target": {"type": "STRING", "description": "object name, wildcard like 'Wheel*', comma list, or 'all' (color/transform/delete)"},
             "color": {"type": "STRING", "description": "color name ('red', 'gold') or #rrggbb"},
