@@ -11,6 +11,7 @@ datas = [
     ('plugins', 'plugins'),
     ('actions', 'actions'),
     ('assets', 'assets'),
+    ('ui/qml', 'ui/qml'),                # Dynamic Island (Qt Quick)
 ]
 binaries = []
 hiddenimports = [
@@ -20,6 +21,8 @@ hiddenimports = [
     'PyQt6.QtWidgets',
     'PyQt6.QtOpenGL',
     'PyQt6.QtOpenGLWidgets',
+    'PyQt6.QtQml',
+    'PyQt6.QtQuick',
     'google.genai',
     'sounddevice',
     'numpy',
@@ -45,6 +48,8 @@ hiddenimports = [
     'yaml',
     'cryptography',
     'ui.window',
+    'ui.dynamic_island',
+    'ui.dynamic_island_legacy',
     'ui.fx',
     'ui.pages',
     'ui.panels',
