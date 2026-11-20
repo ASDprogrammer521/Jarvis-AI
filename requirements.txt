@@ -47,6 +47,7 @@ tinytuya                             # smart-home devices
 google-api-python-client             # Google services
 google-auth-oauthlib
 pynvml                               # system_monitor + HUD GPU meter (NVIDIA)
+vosk>=0.3.45                         # offline mode: voice commands without internet (small model downloads once while online)
 
 # ── Windows only ─────────────────────────────────────
 comtypes;   sys_platform == "win32"

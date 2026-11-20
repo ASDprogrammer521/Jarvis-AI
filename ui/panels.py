@@ -59,6 +59,39 @@ def _safe(timer, fn) -> None:
         timer.stop()
 
 
+
+def _theme_row(win) -> QHBoxLayout:
+    """One card per ready-made theme: a small preview (background + accent dots) and its name; the current one is outlined."""
+    from ui.theme import THEMES, THEME_ORDER, T, current_theme
+    row = QHBoxLayout()
+    row.setSpacing(T.S3)
+    cur = current_theme() if not (read_cfg().get("ui_theme") == "" and read_cfg().get("ui_color")) else ""
+    btns = []
+
+    def mark(active: str):
+        for key, b in btns:
+            on = key == active
+            b.setStyleSheet(
+                f"QPushButton {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {THEMES[key]['over'].get('BG', '#0a0d12')}, "
+                f"stop:0.55 {THEMES[key]['over'].get('PANEL', '#161b24')}, stop:1 {THEMES[key]['over'].get('PRI', THEMES[key]['accent'])}); "
+                f"color: #ffffff; border-radius: {T.R_MD}px; "
+                f"border: 2px solid {C.PRI if on else rgba('#ffffff', .10)}; padding: 0; font-weight: 600; font-size: 11px; }}"
+                f"QPushButton:hover {{ border-color: {C.PRI_DIM if not on else C.PRI}; }}")
+
+    for key in THEME_ORDER:
+        th = THEMES[key]
+        b = QPushButton(th["label"])
+        b.setFixedSize(92, 62)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setToolTip(f"{th['label']} theme")
+        b.clicked.connect(lambda _=False, k=key: (win.set_theme(k), mark(k)))
+        btns.append((key, b))
+        row.addWidget(b)
+    row.addStretch()
+    mark(cur)
+    return row
+
+
 class PluginForm(QWidget):
     _done = pyqtSignal(str, bool, str)
 
@@ -171,7 +204,7 @@ class PluginForm(QWidget):
 class SettingsPanel(GlassCard):
     PAGES = (("general", "General", "gear"), ("appearance", "Appearance", "cube"),
              ("voice", "Voice & AI", "mic"), ("gestures", "Gestures", "cube"), ("modules", "Modules", "stats"), ("face", "Face ID", "cube"), ("plugins", "Plugins", "stats"),
-             ("memory", "Memory", "chat"), ("about", "About", "home"))
+             ("nudges", "Nudges", "stats"), ("memory", "Memory", "chat"), ("about", "About", "home"))
 
     def __init__(self, win, parent=None):
         super().__init__(parent, radius=26, tint=190)
@@ -297,6 +330,8 @@ class SettingsPanel(GlassCard):
     def _page_appearance(self, lay):
         w = self.win
         lay.addWidget(_hdr("Appearance", "Colours, 3D model and visual effects — applied instantly"))
+        lay.addWidget(section_label("Theme"))
+        lay.addLayout(_theme_row(w))
         lay.addWidget(section_label("Accent colour"))
         hue = HueSlider(C.PRI)
         hex_in = QLineEdit(C.PRI)
@@ -836,6 +871,90 @@ class SettingsPanel(GlassCard):
         if secs:
             lay.addWidget(section_label("Plugin settings"))
             lay.addWidget(PluginForm(secs))
+
+    def _page_nudges(self, lay):
+        """Settings → Nudges: what Jarvis tells you on its own. Every change is saved at once and applies on the next check."""
+        from core.nudges import RULE_INFO, merged_cfg
+        w = self.win
+        lay.addWidget(_hdr("Nudges", "Jarvis speaks up when it matters — and stays quiet otherwise"))
+        st = merged_cfg(read_cfg().get("nudges"))
+
+        def save():
+            patch_cfg(nudges=st)
+
+        def put(d, key, value):
+            d[key] = value
+            save()
+
+        master = Toggle(st["enabled"])
+        master.toggled.connect(lambda v: put(st, "enabled", v))
+        lay.addWidget(setting_row("Smart nudges", "Meeting, battery and workout reminders without asking", master))
+        lay.addWidget(divider())
+        vo = Toggle(st["voice"])
+        vo.toggled.connect(lambda v: put(st, "voice", v))
+        lay.addWidget(setting_row("Say them aloud", "Off: they only appear on screen. Jarvis never interrupts while it is talking", vo))
+        lay.addWidget(divider())
+        lay.addWidget(section_label("Reminders"))
+        for name, (label, sub, key, opts, fmt) in RULE_INFO.items():
+            r = st["rules"][name]
+            box = QWidget()
+            h = QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(12)
+            combo = QComboBox()
+            values = list(opts) if r[key] in opts else sorted(set(opts) | {r[key]})
+            for o in values:
+                combo.addItem(fmt.format(o), o)
+            combo.setCurrentIndex(values.index(r[key]))
+            combo.currentIndexChanged.connect(lambda _i, rr=r, k=key, c=combo: put(rr, k, c.currentData()))
+            tg = Toggle(r["on"])
+            tg.toggled.connect(lambda v, rr=r: put(rr, "on", v))
+            h.addWidget(combo)
+            h.addWidget(tg)
+            lay.addWidget(setting_row(label, sub, box))
+            lay.addWidget(divider())
+        lay.addWidget(section_label("Quiet hours"))
+        q = st["quiet"]
+        box = QWidget()
+        h = QHBoxLayout(box)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        for key, times in (("from", ("20:00", "21:00", "22:00", "23:00", "00:00")), ("to", ("05:00", "06:00", "07:00", "08:00", "09:00"))):
+            c = QComboBox()
+            vals = list(times) if q[key] in times else sorted(set(times) | {q[key]})
+            c.addItems(vals)
+            c.setCurrentIndex(vals.index(q[key]))
+            c.currentTextChanged.connect(lambda t, k=key: put(q, k, t))
+            h.addWidget(c)
+        qt = Toggle(q["on"])
+        qt.toggled.connect(lambda v: put(q, "on", v))
+        h.addWidget(qt)
+        lay.addWidget(setting_row("Quiet hours", "No nudges at all between these times", box))
+        lay.addWidget(divider())
+        row = QHBoxLayout()
+
+        def snooze(minutes):
+            try:
+                from core import nudges as _n
+                if _n.ENGINE is not None:
+                    _n.ENGINE.snooze(minutes)
+                    w._toast(f"🔕 Nudges paused for {minutes // 60} h" if minutes >= 60 else f"🔕 Nudges paused for {minutes} min")
+                else:
+                    w._toast("Nudges start a moment after Jarvis connects")
+            except Exception:
+                pass
+
+        for text, fn in (("Pause for 1 hour", lambda: snooze(60)), ("Pause for 4 hours", lambda: snooze(240)),
+                         ("Show a test nudge", lambda: w._toast("🔔 This is how a nudge looks"))):
+            b = GlowButton(text)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+        tip = QLabel("Meeting reminders need Google connected — say “connect Google”. You can also say: “turn off battery reminders”.")
+        tip.setWordWrap(True)
+        tip.setStyleSheet(f"color: {C.TEXT_DIM}; margin-top: 6px;")
+        lay.addWidget(tip)
 
     def _page_memory(self, lay):
         w = self.win

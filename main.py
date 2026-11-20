@@ -3,9 +3,9 @@ from __future__ import annotations
 import os as _os
 
 # MediaPipe / TFLite print C++ warnings ("W0000 … inference_feedback_manager.cc …") straight to stderr — keep the console clean.
-_os.environ.setdefault("GLOG_minloglevel", "2")
+_os.environ.setdefault("GLOG_minloglevel", "3")
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-_os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+_os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
 
 import platform as _platform
 import subprocess as _subprocess
@@ -326,7 +326,10 @@ TOOL_DECLARATIONS = [
             "in another language ('translate what is on my screen'). Put the user's question in `text`. "
             "You have NO visual ability without this tool. "
             "After the image is captured it is sent directly to you — describe what you see and answer the user's question. "
-            "When using camera: the live view stays open until user says close it or calls close_camera."
+            "When using camera: the live view stays open until the user explicitly says close it (close_camera) — "
+            "never close it yourself. Use angle='camera' whenever the user shows something to the camera: a board, "
+            "paper, notebook, handwriting, an equation or a problem ('solve this', 'what's written here', "
+            "'yechib ber', 'doskada nima yozilgan')."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -338,11 +341,34 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "open_camera",
+        "description": (
+            "Opens the live camera view on screen WITHOUT analysing anything, and keeps it open until the user asks "
+            "to close it. Call when the user says (in ANY language): open the camera, turn on camera, show me the "
+            "camera, kamerani och, kamerani yoq. Optionally open it directly in full screen."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {
+            "fullscreen": {"type": "BOOLEAN", "description": "true to open it in full screen right away"}
+        }, "required": []}
+    },
+    {
+        "name": "camera_fullscreen",
+        "description": (
+            "Makes the live camera view full screen (on=true) or returns it to the small panel (on=false). "
+            "Call when the user says (in ANY language): camera full screen, make it bigger, fullscreen, "
+            "kamerani to'liq ekran qil, kattalashtir; and with on=false for: exit full screen, make it smaller, "
+            "kichraytir, oddiy holatga qaytar. Opens the camera first if it is closed."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {
+            "on": {"type": "BOOLEAN", "description": "true = full screen, false = back to the small panel. Default true."}
+        }, "required": []}
+    },
+    {
         "name": "close_camera",
         "description": (
             "Closes the live camera view shown on screen. "
-            "Call when the user says (in ANY language): close camera, stop camera, "
-            "turn off camera, that's creepy, etc."
+            "Call ONLY when the user says (in ANY language): close camera, stop camera, "
+            "turn off camera, kamerani yop, kamerani o'chir, that's creepy, etc."
         ),
         "parameters": {"type": "OBJECT", "properties": {}, "required": []}
     },
@@ -574,6 +600,8 @@ class JarvisLive:
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas
         self.ui.request_say = self.plugin_say
 
+        self._net_fail         = 0            # consecutive failed Live connections (offline mode kicks in at 3)
+        self._offline          = None         # core.offline.OfflineMode, created on first use
         self._wake_enabled     = get_wake_word_enabled()
         self._awake            = not self._wake_enabled
         self._wake_detector: WakeWordDetector | None = None
@@ -760,10 +788,13 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual, fingerprint
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
-            return
         if getattr(self.ui, "locked", False):
             self.ui.write_log("SYS: Jarvis is locked — show your face or enter the PIN.")
+            return
+        if self._offline is not None and self._offline.active:
+            self._offline.handle_text(text)               # no internet: the local command mode answers
+            return
+        if not self._loop or not self.session:
             return
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
@@ -1049,8 +1080,7 @@ class JarvisLive:
                     angle     = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
                     if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
-                        self.ui.start_camera_stream()
+                        img_b, mime_t = await self._grab_camera(loop)
                         self._vision_cam_active = True
                         print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
                         _stall = "camera"
@@ -1065,6 +1095,18 @@ class JarvisLive:
                         f"is arriving with this result. Reply once, from what you actually see "
                         f"in it."
                     )
+
+            elif name == "open_camera":
+                self.ui.start_camera_stream()
+                if args.get("fullscreen"):
+                    self.ui.camera_fullscreen(True)
+                result = "Camera is open and will stay open until the user asks to close it."
+
+            elif name == "camera_fullscreen":
+                on = args.get("on", True)
+                on = on if isinstance(on, bool) else str(on).lower() not in ("false", "0", "no", "off")
+                self.ui.camera_fullscreen(on)
+                result = "Camera is now full screen." if on else "Camera is back to the small panel."
 
             elif name == "close_camera":
                 self.ui.stop_camera_stream()
@@ -1235,6 +1277,83 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
 
+    # ── offline mode (no / too poor internet) ────────────────────────────────────────────────────────────────────────
+    def _offline_mode(self):
+        if self._offline is None:
+            from core.offline import OfflineMode
+            self._offline = OfflineMode(
+                ui=self.ui, run_tool=self._offline_run_tool,
+                asst_name=lambda: self._asst_name,
+                need_name=lambda: self._wake_enabled)
+        return self._offline
+
+    def _offline_run_tool(self, name: str, args: dict, say) -> str:
+        """Blocking: the same local tools Gemini would call, run without a session."""
+        if name == "system_status":
+            return str(get_system_status())
+        if self._action_registry.has(name):
+            ctx = {"player": self.ui, "speak": say, "response": None, "session_memory": None}
+            return self._action_registry.run(name, args, ctx) or "Done."
+        return f"Unknown tool: {name}"
+
+    async def _ensure_network(self):
+        """Return once the line is good enough for Gemini Live. While it is not, run the offline mode (local commands)."""
+        from core import offline as off
+        if not off.auto_enabled():
+            return
+        loop = asyncio.get_running_loop()
+        forced = self._net_fail >= 3                       # the line looks fine but Live keeps failing (blocked, VPN…)
+        ms = None if forced else await loop.run_in_executor(None, off.probe)
+        if off.good(ms):
+            return
+        om = self._offline_mode()
+        om.start()
+        t0 = time.monotonic()
+        ok_in_a_row = 0
+        try:
+            while not self._shutdown_event.is_set():
+                await asyncio.sleep(6)
+                if forced and time.monotonic() - t0 < 30:
+                    continue
+                ms = await loop.run_in_executor(None, off.probe)
+                ok_in_a_row = ok_in_a_row + 1 if off.good(ms) else 0
+                if ok_in_a_row >= 2:                       # two good checks in a row: the line is back
+                    break
+        finally:
+            om.stop(back_online=not self._shutdown_event.is_set())
+            self._net_fail = 0
+
+    async def _watch_link(self):
+        """While the live session runs: if the line stays too poor for ~25 s, drop the session quietly (→ offline mode)."""
+        from core import offline as off
+        loop = asyncio.get_running_loop()
+        strikes = 0
+        while True:
+            await asyncio.sleep(8)
+            if not off.auto_enabled():
+                continue
+            ms = await loop.run_in_executor(None, off.probe)
+            strikes = 0 if off.good(ms) else strikes + 1
+            if strikes >= 3:
+                raise off.LinkDown("link too poor")
+
+    async def _grab_camera(self, loop) -> tuple[bytes, str]:
+        """A frame for the model from the SAME capture the on-screen preview uses.
+
+        Opening the webcam a second time (what `_capture_camera` does) fights the live view for the device and
+        costs ~0.5 s of warm-up; the preview already has a fresh frame, so take that one. Falls back to a direct
+        capture only if the live view produces nothing."""
+        fresh = not self.ui.camera_is_open()
+        self.ui.start_camera_stream()
+        if fresh:
+            await asyncio.sleep(0.7)                  # let the exposure settle after a cold start
+        for _ in range(40):
+            data = await loop.run_in_executor(None, self.ui.grab_camera_jpeg)
+            if data:
+                return data, "image/jpeg"
+            await asyncio.sleep(0.1)
+        return await loop.run_in_executor(None, _capture_camera)
+
     async def _flush_pending_vision(self) -> bool:
         """Send a captured frame immediately after its tool response.
 
@@ -1257,10 +1376,16 @@ class JarvisLive:
 
         src = ("[IMAGE SOURCE: WEBCAM]" if angle == "camera"
                else "[IMAGE SOURCE: SCREEN CAPTURE]")
+        hint = ""
+        if angle == "camera":
+            hint = ("\n[If the picture shows a board, paper or notebook with a handwritten or printed task "
+                    "(maths, physics, code, a question), read it carefully and, when the user asks, solve it: "
+                    "say the key steps briefly and the final answer, in the user's language. If something is "
+                    "unreadable, say which part and ask to rewrite it larger.]")
         await self.session.send_client_content(
             turns={"role": "user", "parts": [
                 {"inline_data": {"mime_type": mime_t, "data": b64}},
-                {"text": f"{src}\n\n{question}"},
+                {"text": f"{src}{hint}\n\n{question}"},
             ]},
             turn_complete=True,
         )
@@ -1354,12 +1479,8 @@ class JarvisLive:
                             out_buf = []
 
                             if self._vision_close_pending:
-                                self._vision_close_pending = False
-                                self._vision_busy = False
-                                async def _cam_close():
-                                    await asyncio.sleep(2.0)
-                                    self.ui.stop_camera_stream()
-                                asyncio.create_task(_cam_close())
+                                self._vision_close_pending = False   # the live camera view is NOT closed here any more:
+                                self._vision_busy = False            # only the user's "close camera" does that
 
                     if response.tool_call:
                         fn_responses = []
@@ -1372,8 +1493,10 @@ class JarvisLive:
                         )
                         await self._flush_pending_vision()
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
+            from core import offline as _off
+            if not _off.is_network_error(e):               # a dropped connection is handled quietly by the run loop
+                print(f"[JARVIS] ❌ Recv: {e}")
+                traceback.print_exc()
             raise
 
     async def _play_audio(self):
@@ -1800,12 +1923,39 @@ class JarvisLive:
         self._run_task = asyncio.current_task()
         self._reconnect_event = asyncio.Event()
 
+        from core import offline as _off
+        _off.quiet_network_logs()
+        _default_exc_handler = self._loop.get_exception_handler()
+
+        def _quiet_loop_errors(lp, ctx):                    # "Task exception was never retrieved" for dropped connections
+            exc = ctx.get("exception")
+            if exc is not None and _off.is_network_error(exc):
+                return
+            if _default_exc_handler:
+                _default_exc_handler(lp, ctx)
+            else:
+                lp.default_exception_handler(ctx)
+        self._loop.set_exception_handler(_quiet_loop_errors)
+
         confirm_gate.bind(
             show = self.ui.show_confirm,
             hide = self.ui.hide_confirm,
             log  = self.ui.write_log,
         )
         set_trim_notifier(self.ui.write_log)
+
+        try:                                                 # proactive reminders (meetings, battery, workouts) — Settings → Nudges
+            from core import nudges as _nudges
+            from memory.config_manager import load_api_keys as _load_keys
+            _nudges.ENGINE = _nudges.Nudges(
+                notify=self.ui.notify,
+                speak=self.speak,
+                busy=lambda: bool(self._is_speaking),
+                cfg_fn=lambda: (_load_keys() or {}).get("nudges"),
+                state_path=BASE_DIR / "memory" / "nudges_state.json")
+            _nudges.ENGINE.start()
+        except Exception as _e:                              # never let a reminder problem stop Jarvis
+            print(f"[JARVIS] nudges: {_e}")
 
         audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
 
@@ -1839,6 +1989,7 @@ class JarvisLive:
 
         while not self._shutdown_event.is_set():
             try:
+                await self._ensure_network()                # offline mode while the internet is down / too poor
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
                 _resumed_with = self._resume_handle is not None
@@ -1866,6 +2017,8 @@ class JarvisLive:
                     self._interrupted          = False
 
                     print("[JARVIS] Connected.")
+                    self._net_fail = 0
+                    self._offline_mode().prepare_async()    # fetch the offline speech model once, while the line is good
                     if _resumed_with:
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
 
@@ -1884,6 +2037,7 @@ class JarvisLive:
 
                     self._reconnect_event.clear()
                     tg.create_task(self._watch_reconnect())
+                    tg.create_task(self._watch_link())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
@@ -1914,6 +2068,15 @@ class JarvisLive:
                     if not _keep_context_of(e):
                         self._resume_handle = None
                     self._conn_backoff = 0
+                    continue
+
+                if _off.is_network_error(e):
+                    # A dropped / poor connection is not an error worth a traceback: count it and let the top of the
+                    # loop decide (online again, or offline mode with local commands).
+                    self._net_fail += 1
+                    self._conn_backoff = 2
+                    self.set_speaking(False)
+                    await asyncio.sleep(1)
                     continue
 
                 if _resumed_with and (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import math
 import os
 import platform
 import re
@@ -11,7 +12,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from PyQt6.QtCore import QCoreApplication, QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, Qt, QTimer, QUrl, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QFont, QImage, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QPolygonF, QRadialGradient, QSurfaceFormat
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -22,8 +23,9 @@ import ui.theme as ui_theme
 from ui.fx import GL_ENABLED, Backdrop, GlassCard, GlowButton, ModalLayer, Stage3D, Toggle, fade_in, slide_to
 from ui.metrics import _metrics
 from ui.panels import APP_VERSION, ConfirmPanel, RemotePanel, SettingsPanel, SetupPanel
-from ui.theme import C, DEFAULT_ACCENT, apply_accent, build_qss, patch_cfg, qcol, read_cfg, rgba
+from ui.theme import C, DEFAULT_ACCENT, T, apply_accent, apply_theme, build_qss, current_theme, patch_cfg, qcol, read_cfg, rgba
 from ui.video_extras import PlayerButton, PlayButton, PlayerSettings, VideosOverlay
+from ui.toasts import ToastCenter
 from ui.pages import DashboardPage, InputBar, LogoMark, NavItem, PhonePage, Sidebar
 from ui.widgets import ChatView, IconButton, StatePill, font
 
@@ -85,6 +87,589 @@ class CompactMic(QWidget):
         self.restore.emit()
 
 
+def _mmss(sec) -> str:
+    sec = int(max(0, sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+WORKOUT_TITLES = {"PUSH-UPS", "SQUATS", "SIT-UPS", "PULL-UPS", "PLANK"}
+
+
+class PushupHUD(QWidget):
+    """The big workout counter in the top-left corner of the full-screen view (push-ups, squats, sit-ups, pull-ups, plank).
+
+    Three looks: reps (a big number), time (plank: a big m:ss clock) and rest (a countdown between sets, in green).
+    Painted by hand (no pixmaps, no timer): it redraws only when new numbers arrive (~14 times a second) and for the short
+    "pop" animation that plays every time a rep is counted."""
+
+    BW, BH = 300, 276
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.label = "PUSH-UPS"
+        self.mode = "reps"                                # reps | time | rest
+        self.reps = 0                                     # this set's number (plank: seconds held)
+        self.target = None
+        self.good = 0
+        self.elapsed = 0.0
+        self.ok = False
+        self.set_no, self.sets = 1, 1
+        self.rest_left, self.rest_total = 0.0, 60
+        self.record = False
+        self._k = 1.0
+        self._pop = 1.0                                   # 0 → 1 after each rep (plank: each second)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(420)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_pop)
+        self.hide()
+        self.place()
+
+    def _on_pop(self, v):
+        self._pop = float(v)
+        self.update()
+
+    def reset(self):
+        self.mode, self.reps, self.target, self.good, self.elapsed, self.ok = "reps", 0, None, 0, 0.0, False
+        self.set_no, self.sets, self.rest_left, self.record = 1, 1, 0.0, False
+        self._anim.stop()
+        self._pop = 1.0
+
+    def set_stats(self, d: dict):
+        n = int(d.get("value", d.get("reps", 0)))
+        mode = str(d.get("mode", "reps"))
+        if self.isVisible() and mode != "rest" and mode == self.mode and n > self.reps:
+            self._anim.stop()
+            self._anim.start()
+        self.mode = mode
+        self.label = str(d.get("label") or "PUSH-UPS")
+        self.reps = n
+        self.target = d.get("target") or None
+        self.good = int(d.get("good", 0))
+        self.elapsed = float(d.get("elapsed", 0.0))
+        self.ok = bool(d.get("ok", False))
+        self.set_no, self.sets = int(d.get("set", 1)), int(d.get("sets", 1))
+        self.rest_left, self.rest_total = float(d.get("rest_left", 0.0)), max(1.0, float(d.get("rest_total", 60)))
+        self.record = bool(d.get("record", False))
+        self.update()
+
+    def place(self):
+        p = self.parentWidget()
+        if p is None:
+            return
+        self._k = max(0.7, min(1.5, p.height() / 1080.0))      # scales with the screen: the same look on 1080p and 4K
+        self.setFixedSize(int(self.BW * self._k), int(self.BH * self._k))
+        self.move(int(22 * self._k), int(58 * self._k))
+
+    @staticmethod
+    def _outlined(p, rect, flags, text, color, shadow=170, d=2.0):
+        """Text with a dark outline: readable on any camera picture without a background box."""
+        p.setPen(QColor(0, 0, 0, shadow))
+        for dx, dy in ((-d, 0), (d, 0), (0, -d), (0, d), (d, d), (-d, d), (d, -d), (-d, -d)):
+            p.drawText(rect.translated(dx, dy), flags, text)
+        p.setPen(color)
+        p.drawText(rect, flags, text)
+
+    def paintEvent(self, _):
+        """No card, no background: just the big number, a small caption and the clock, outlined so they read on the camera picture."""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.scale(self._k, self._k)
+        W = self.BW
+        R = Qt.AlignmentFlag
+        resting = self.mode == "rest"
+        gold = QColor(92, 255, 176) if resting else QColor(255, 214, 102)
+        pop = 1.0 if resting else self._pop
+        # small title line (+ set n/N), left-aligned
+        f = font(10, QFont.Weight.Bold)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+        p.setFont(f)
+        title = self.label + (f"  ·  SET {self.set_no}/{self.sets}" if self.sets > 1 else "")
+        if self.record:
+            title = "🏆 " + title
+        self._outlined(p, QRectF(4, 0, W, 24), R.AlignLeft | R.AlignVCenter, title, QColor(255, 255, 255, 235), d=1.5)
+        # the big number: reps / m:ss / rest seconds
+        if resting:
+            text, px = str(int(math.ceil(self.rest_left))), 190
+        elif self.mode == "time":
+            text, px = _mmss(self.reps), 124
+        else:
+            text, px = str(self.reps), (190 if len(str(self.reps)) <= 2 else 140)
+        nf = font(10, QFont.Weight.Black)
+        nf.setPixelSize(px)
+        p.save()
+        p.translate(4, 120)
+        sc = 1.0 + 0.30 * (1 - pop) ** 2                  # pops on every rep, then settles
+        p.scale(sc, sc)                                   # (grows from the left edge so it stays in the corner)
+        p.translate(0, 0)
+        p.setFont(nf)
+        mix = (1 - pop) * 0.85
+        col = QColor(int(gold.red() + (255 - gold.red()) * mix), int(gold.green() + (255 - gold.green()) * mix),
+                     int(gold.blue() + (255 - gold.blue()) * mix))
+        self._outlined(p, QRectF(0, -100, W, 200), R.AlignLeft | R.AlignVCenter, text, col, shadow=190, d=3.0)
+        p.restore()
+        # "of 15" / "rest · next set" next to the number's baseline
+        cap = None
+        if resting:
+            cap = f"REST · next: set {min(self.sets, self.set_no + 1)}"
+        elif self.target:
+            cap = f"of {_mmss(self.target)}" if self.mode == "time" else f"of {self.target}"
+        if cap:
+            p.setFont(font(14, QFont.Weight.Bold))
+            self._outlined(p, QRectF(4, 200, W, 26), R.AlignLeft | R.AlignVCenter, cap, QColor(235, 242, 255), d=1.6)
+        # the clock, a bit bigger than a caption
+        cf = font(18, QFont.Weight.Black)
+        cf.setPixelSize(40)
+        p.setFont(cf)
+        self._outlined(p, QRectF(4, 204 if not cap else 224, W, 44), R.AlignLeft | R.AlignVCenter,
+                       "⏱ " + _mmss(self.elapsed), QColor(255, 255, 255), d=2.0)
+
+
+class WorkoutPanel(QWidget):
+    """Side panels for the workout view, drawn in the free strips beside the camera picture.
+
+    side="left":  today's ring (progress to the daily goal), streak, the sets done so far and the record to beat.
+    side="right": technique — a live angle gauge, the form verdict and one bar per rep (green = clean, amber = flawed,
+                  height = how long the rep took).
+    Painted by hand and repainted only when numbers arrive (~14 times a second)."""
+
+    BW, BH = 210, 330
+
+    def __init__(self, parent, side: str):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.side = side
+        self.d: dict = {}
+        self._k = 1.0
+        self.hide()
+
+    def set_stats(self, d: dict):
+        self.d = d
+        self.update()
+
+    def scale_to(self, k: float):
+        self._k = k
+        self.setFixedSize(int(self.BW * k), int(self.BH * k))
+
+    # ── drawing helpers ──
+    @staticmethod
+    def _t(p, x, y, w, h, text, size=11, weight=QFont.Weight.DemiBold, color=(225, 235, 250, 230), align=Qt.AlignmentFlag.AlignLeft, spacing=0):
+        f = font(size, weight)
+        if spacing:
+            f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
+        p.setFont(f)
+        p.setPen(QColor(*color))
+        p.drawText(QRectF(x, y, w, h), align | Qt.AlignmentFlag.AlignVCenter, text)
+
+    def paintEvent(self, _):
+        d = self.d
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.scale(self._k, self._k)
+        W, H = self.BW, self.BH
+        acc = qcol(C.PRI)
+        bg = QLinearGradient(0, 0, 0, H)
+        bg.setColorAt(0.0, QColor(16, 22, 38, 235))
+        bg.setColorAt(1.0, QColor(8, 11, 20, 235))
+        p.setPen(QPen(QColor(acc.red(), acc.green(), acc.blue(), 120), 1.4))
+        p.setBrush(QBrush(bg))
+        p.drawRoundedRect(QRectF(1, 1, W - 2, H - 2), 20, 20)
+        if not d:
+            return
+        (self._left if self.side == "left" else self._right)(p, d, W, H, acc)
+
+    def _left(self, p, d, W, H, acc):
+        A = Qt.AlignmentFlag
+        time_mode = d.get("unit") == "seconds"
+        self._t(p, 18, 12, W - 36, 18, "TODAY", 8, QFont.Weight.Bold, (acc.red(), acc.green(), acc.blue(), 235), spacing=3)
+        # daily-goal ring
+        goal = max(1, int(d.get("goal", 100)))
+        today = int(d.get("today", 0))
+        frac = max(0.0, min(1.0, today / goal))
+        cx, cy, r = W / 2, 84.0, 44.0
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 34), 9))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+        done = today >= goal
+        col = QColor(92, 255, 176) if done else QColor(255, 214, 102)
+        pen = QPen(col, 9)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        if frac > 0:
+            p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), 90 * 16, -int(360 * 16 * frac))
+        self._t(p, cx - 40, cy - 19, 80, 30, _mmss(today) if time_mode else str(today), 20, QFont.Weight.Black, (255, 255, 255, 255), A.AlignCenter)
+        self._t(p, cx - 40, cy + 8, 80, 16, f"/ {_mmss(goal) if time_mode else goal}", 9, QFont.Weight.DemiBold, (170, 185, 215, 230), A.AlignCenter)
+        streak = int(d.get("streak", 0))
+        self._t(p, 14, 138, W - 28, 20, f"🔥 {streak}-day streak" if streak else "Start your streak today", 10, QFont.Weight.DemiBold,
+                (255, 190, 110, 240) if streak else (170, 185, 215, 220), A.AlignCenter)
+        p.setPen(QPen(QColor(255, 255, 255, 26), 1))
+        p.drawLine(QPointF(16, 166), QPointF(W - 16, 166))
+        # sets
+        self._t(p, 18, 172, W - 36, 16, "SETS", 8, QFont.Weight.Bold, (150, 165, 200, 230), spacing=3)
+        y = 192
+        for n, v, g in (d.get("sets_done") or [])[-4:]:
+            self._t(p, 18, y, 70, 20, f"Set {n}", 10, color=(200, 212, 235, 230))
+            self._t(p, W - 100, y, 82, 20, (_mmss(v) if time_mode else str(v)) + "  ✓", 11, QFont.Weight.Bold, (92, 255, 176, 240), A.AlignRight)
+            y += 21
+        if d.get("mode") != "rest" and int(d.get("sets", 1)) >= int(d.get("set", 1)):
+            self._t(p, 18, y, 70, 20, f"Set {int(d.get('set', 1))}", 10, QFont.Weight.Bold, (255, 214, 102, 245))
+            self._t(p, W - 100, y, 82, 20, (_mmss(d.get("value", 0)) if time_mode else str(d.get("value", 0))) + "  ▸", 11, QFont.Weight.Bold,
+                    (255, 214, 102, 245), A.AlignRight)
+        # record to beat
+        best, total = int(d.get("best", 0)), int(d.get("total", 0))
+        p.setPen(QPen(QColor(255, 255, 255, 26), 1))
+        p.drawLine(QPointF(16, 276), QPointF(W - 16, 276))
+        if best > 0:
+            self._t(p, 18, 280, 100, 16, "RECORD", 8, QFont.Weight.Bold, (150, 165, 200, 230), spacing=3)
+            self._t(p, W - 100, 280, 82, 16, f"🏆 {_mmss(best) if time_mode else best}", 10, QFont.Weight.Bold, (255, 214, 102, 245), A.AlignRight)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 34))
+            p.drawRoundedRect(QRectF(18, 304, W - 36, 8), 4, 4)
+            fr = max(0.0, min(1.0, total / float(best)))
+            p.setBrush(QColor(92, 255, 176) if total > best else QColor(255, 214, 102))
+            if fr > 0:
+                p.drawRoundedRect(QRectF(18, 304, max(8.0, (W - 36) * fr), 8), 4, 4)
+        else:
+            self._t(p, 14, 282, W - 28, 36, "First time — set your record!", 10, QFont.Weight.DemiBold, (170, 185, 215, 230), A.AlignCenter)
+
+    def _right(self, p, d, W, H, acc):
+        A = Qt.AlignmentFlag
+        self._t(p, 18, 12, W - 36, 18, "TECHNIQUE", 8, QFont.Weight.Bold, (acc.red(), acc.green(), acc.blue(), 235), spacing=3)
+        # angle gauge: a half-circle, the needle follows the joint angle (0° left … 180° right)
+        ang = max(0, min(180, int(d.get("angle", 0))))
+        cx, cy, r = W / 2, 112.0, 58.0
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 34), 9))
+        p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), 0, 180 * 16)
+        ok = bool(d.get("ok"))
+        col = QColor(92, 255, 176) if ok else QColor(255, 200, 87)
+        pen = QPen(col, 9)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        if ang > 0:
+            p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), 180 * 16, -int(ang * 16))
+        a = math.radians(180 - ang)
+        p.setPen(QPen(QColor(255, 255, 255, 235), 2.4))
+        p.drawLine(QPointF(cx, cy), QPointF(cx + math.cos(a) * (r - 14), cy - math.sin(a) * (r - 14)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(QPointF(cx, cy), 4.5, 4.5)
+        self._t(p, cx - 50, cy + 6, 100, 30, f"{ang}°", 19, QFont.Weight.Black, (255, 255, 255, 255), A.AlignCenter)
+        self._t(p, 10, cy + 34, W - 20, 16, "body line" if d.get("unit") == "seconds" else "joint angle", 8, color=(150, 165, 200, 220), align=A.AlignCenter, spacing=1)
+        # verdict
+        log = d.get("rep_log") or []
+        if d.get("unit") == "seconds":
+            verdict, vcol = (f"Longest hold {_mmss(d.get('best_streak', 0))}", (92, 255, 176, 240))
+            bad = int(d.get("breaks", 0))
+            if bad:
+                verdict, vcol = (f"Form broke ×{bad}", (255, 200, 87, 240))
+        elif log:
+            last = log[-1]
+            verdict, vcol = (("Clean rep ✓", (92, 255, 176, 240)) if last[0] else ((last[2] or "Check form"), (255, 200, 87, 240)))
+        else:
+            verdict, vcol = ("Waiting for the first rep", (170, 185, 215, 230))
+        self._t(p, 12, 166, W - 24, 22, str(verdict)[:26], 11, QFont.Weight.Bold, vcol, A.AlignCenter)
+        p.setPen(QPen(QColor(255, 255, 255, 26), 1))
+        p.drawLine(QPointF(16, 196), QPointF(W - 16, 196))
+        # one bar per rep
+        self._t(p, 18, 202, W - 36, 16, "EACH REP", 8, QFont.Weight.Bold, (150, 165, 200, 230), spacing=3)
+        if log:
+            secs = [x[1] for x in log]
+            top = max(max(secs), 1.0)
+            n = len(log)
+            bw = min(10.0, (W - 36) / max(n, 1) - 3)
+            x0 = 18
+            p.setPen(Qt.PenStyle.NoPen)
+            for i, (good, sec, _issue) in enumerate(log):
+                h = 12 + 50 * (sec / top)
+                p.setBrush(QColor(92, 255, 176, 230) if good else QColor(255, 200, 87, 230))
+                p.drawRoundedRect(QRectF(x0 + i * (bw + 3), 286 - h, bw, h), 3, 3)
+            avg = sum(secs) / len(secs)
+            self._t(p, 14, 292, W - 28, 30, f"last {secs[-1]:.1f}s  ·  avg {avg:.1f}s", 9, QFont.Weight.DemiBold, (200, 212, 235, 230), A.AlignCenter)
+        else:
+            self._t(p, 14, 240, W - 28, 40, "Bars appear after your first rep", 9, color=(170, 185, 215, 220), align=A.AlignCenter)
+
+
+class CelebrationFX(QWidget):
+    """A new personal record: gold confetti, expanding rings and a big "NEW RECORD · 32" that pops in and fades out (~5 s).
+
+    One QVariantAnimation drives everything and every particle position is a pure function of time, so there is no per-particle
+    state to update — it is a single repaint per frame. Mouse-transparent; hides itself when finished."""
+
+    DURATION = 5200
+    COLORS = ((255, 214, 102), (255, 160, 80), (92, 255, 176), (120, 200, 255), (255, 120, 170), (255, 245, 200))
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.title, self.big, self.sub = "NEW RECORD", "", ""
+        self._t = 1.0
+        self._parts = []
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(self.DURATION)
+        self._anim.valueChanged.connect(self._tick)
+        self._anim.finished.connect(self.hide)
+        self.hide()
+
+    def _tick(self, v):
+        self._t = float(v)
+        self.update()
+
+    def play(self, title: str, big: str, sub: str = ""):
+        import random
+        rnd = random.Random(int(time.time() * 1000) & 0xFFFF)
+        self.title, self.big, self.sub = str(title), str(big), str(sub)
+        # (x 0..1, start delay, fall speed, sway, phase, size, spin, colour)
+        self._parts = [(rnd.random(), rnd.random() * 0.35, 0.55 + rnd.random() * 0.7, 0.02 + rnd.random() * 0.05,
+                        rnd.random() * 6.28, 7 + rnd.random() * 9, (rnd.random() - 0.5) * 14,
+                        self.COLORS[rnd.randrange(len(self.COLORS))]) for _ in range(110)]
+        p = self.parentWidget()
+        if p is not None:
+            self.setGeometry(0, 0, p.width(), p.height())
+        self._anim.stop()
+        self._t = 0.0
+        self.show()
+        self.raise_()
+        self._anim.start()
+
+    def paintEvent(self, _):
+        t = self._t
+        if t >= 1.0 or not self.isVisible():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        W, H = self.width(), self.height()
+        k = max(0.7, min(1.6, H / 1080.0))
+        fade = 1.0 if t < 0.8 else max(0.0, (1.0 - t) / 0.2)
+        enter = min(1.0, t / 0.12)                                     # 0 → 1 over the first ~0.6 s
+        back = 1.0 + 2.7 * (enter - 1) ** 3 + 1.7 * (enter - 1) ** 2   # OutBack: overshoots a little, then settles
+        # dim the picture a little so the text reads
+        p.fillRect(self.rect(), QColor(0, 0, 0, int(95 * fade * min(1.0, t / 0.08))))
+        cx, cy = W / 2, H * 0.42
+        # glow + rings
+        gr = 330 * k
+        g = QRadialGradient(cx, cy, gr)
+        g.setColorAt(0.0, QColor(255, 214, 102, int(120 * fade)))
+        g.setColorAt(1.0, QColor(255, 214, 102, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(g))
+        p.drawEllipse(QPointF(cx, cy), gr, gr)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(3):
+            tt = (t * 1.6 - i * 0.18)
+            if 0 < tt < 1:
+                p.setPen(QPen(QColor(255, 226, 140, int(210 * (1 - tt) * fade)), 4 * k))
+                r = (120 + 520 * tt) * k
+                p.drawEllipse(QPointF(cx, cy), r, r)
+        # confetti
+        p.setPen(Qt.PenStyle.NoPen)
+        for x0, delay, speed, sway, ph, size, spin, col in self._parts:
+            tt = (t - delay * 0.5) / 0.85
+            if tt <= 0 or tt >= 1:
+                continue
+            x = (x0 + math.sin(ph + tt * 9) * sway) * W
+            y = (-0.06 + tt * speed * 1.25) * H
+            if y > H + 20:
+                continue
+            p.save()
+            p.translate(x, y)
+            p.rotate(spin * tt * 60 + ph * 20)
+            flip = abs(math.cos(ph + tt * 10))                         # a spinning chip: its width follows a cosine
+            p.setBrush(QColor(col[0], col[1], col[2], int(235 * fade)))
+            s = size * k
+            p.drawRect(QRectF(-s / 2, -s / 4, s * (0.25 + 0.75 * flip), s / 2))
+            p.restore()
+        # the text
+        p.save()
+        p.translate(cx, cy)
+        p.scale(back, back)
+        tf = font(16, QFont.Weight.Black)
+        tf.setPixelSize(int(46 * k))
+        tf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 10 * k)
+        p.setFont(tf)
+        p.setPen(QColor(255, 255, 255, int(235 * fade)))
+        p.drawText(QRectF(-W / 2, -250 * k, W, 70 * k), Qt.AlignmentFlag.AlignCenter, "🏆  " + self.title)
+        bf = font(10, QFont.Weight.Black)
+        bf.setPixelSize(int(260 * k))
+        p.setFont(bf)
+        p.setPen(QColor(0, 0, 0, int(140 * fade)))
+        p.drawText(QRectF(-W / 2 + 6 * k, -170 * k + 8 * k, W, 300 * k), Qt.AlignmentFlag.AlignCenter, self.big)
+        shimmer = 0.5 + 0.5 * math.sin(t * 22)                         # a slow gold shimmer on the number
+        p.setPen(QColor(255, int(205 + 40 * shimmer), int(90 + 90 * shimmer), int(255 * fade)))
+        p.drawText(QRectF(-W / 2, -170 * k, W, 300 * k), Qt.AlignmentFlag.AlignCenter, self.big)
+        if self.sub:
+            sf = font(13, QFont.Weight.DemiBold)
+            sf.setPixelSize(int(26 * k))
+            sf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 4 * k)
+            p.setFont(sf)
+            p.setPen(QColor(235, 240, 250, int(225 * fade)))
+            p.drawText(QRectF(-W / 2, 150 * k, W, 50 * k), Qt.AlignmentFlag.AlignCenter, self.sub)
+        p.restore()
+
+
+class MiniJarvis(QWidget):
+    """A very light Jarvis for the corner of the full-screen camera: no OpenGL, no pixmaps — a handful of arcs and lines.
+
+    The timer only runs while the widget is visible (full-screen camera) and slows down when Jarvis is idle, so it costs
+    next to nothing next to the camera picture itself. The animation follows Jarvis's state and the loudness of his voice."""
+
+    W, H = 212, 245                                   # a 170 x 196 canvas scaled by W / 170
+    _COL = {"SPEAKING": "ACC2", "LISTENING": "GREEN", "THINKING": "AMBER", "PROCESSING": "AMBER",
+            "SLEEPING": "TEXT_DIM", "MUTED": "RED"}
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(self.W, self.H)
+        self.state = "LISTENING"
+        self._target = 0.0
+        self._lvl = 0.0
+        self._t0 = time.monotonic()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def push(self, level: float):
+        if level > self._target:
+            self._target = level
+
+    def activate(self, on: bool):
+        if on:
+            self.place()
+            self.show()
+            self.raise_()
+            self._timer.start(33)
+        else:
+            self._timer.stop()
+            self.hide()
+
+    def place(self):
+        p = self.parentWidget()
+        if p is not None:
+            self.move(p.width() - self.W - 18, p.height() - self.H - 16)
+
+    def _tick(self):
+        self._lvl += (self._target - self._lvl) * 0.4
+        self._target *= 0.78
+        busy = self.state in ("SPEAKING", "THINKING", "PROCESSING") or self._lvl > 0.02
+        self._timer.setInterval(33 if busy else 80)      # ~30 fps while talking, ~12 fps while idle
+        self.update()
+
+    def paintEvent(self, _):
+        t = time.monotonic() - self._t0
+        st = self.state
+        lvl = min(1.0, self._lvl * 1.6) if st == "SPEAKING" else self._lvl * 0.5
+        col = qcol(getattr(C, self._COL.get(st, "PRI")))
+        r_, g_, b_ = col.red(), col.green(), col.blue()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        k = self.W / 170.0
+        p.scale(k, k)                                        # everything below is drawn on a 170 x 196 canvas
+        cx, cy = 85.0, 84.0
+        # dark glass disc (slightly lighter towards the rim) so the HUD stays readable on any camera picture
+        dg = QRadialGradient(cx, cy, 76)
+        dg.setColorAt(0.0, QColor(8, 14, 26, 175))
+        dg.setColorAt(0.85, QColor(8, 14, 26, 150))
+        dg.setColorAt(1.0, QColor(r_, g_, b_, 70))
+        p.setPen(QPen(QColor(r_, g_, b_, 90), 1.2))
+        p.setBrush(QBrush(dg))
+        p.drawEllipse(QPointF(cx, cy), 74, 74)
+        # sound ripples travelling outwards while Jarvis talks
+        if st == "SPEAKING" or lvl > 0.05:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for i in range(2):
+                ph = (t * 0.9 + i * 0.5) % 1.0
+                p.setPen(QPen(QColor(r_, g_, b_, int(120 * (1 - ph) * min(1.0, 0.4 + lvl))), 1.6))
+                rr = 62 + 22 * ph
+                p.drawEllipse(QPointF(cx, cy), rr, rr)
+        # glow that breathes with the voice
+        g = QRadialGradient(cx, cy, 70)
+        g.setColorAt(0.0, QColor(r_, g_, b_, int(70 + 150 * lvl)))
+        g.setColorAt(0.6, QColor(r_, g_, b_, int(18 + 40 * lvl)))
+        g.setColorAt(1.0, QColor(r_, g_, b_, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(g))
+        p.drawEllipse(QPointF(cx, cy), 70, 70)
+        # fine tick ring (slowly turning), like a dial
+        spin = 220 if st in ("THINKING", "PROCESSING") else (90 if st == "SPEAKING" else 34)
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(t * spin * 0.25)
+        for i in range(48):
+            a = i * math.tau / 48
+            long_ = i % 4 == 0
+            r0, r1 = (63.5, 68.5) if long_ else (65.5, 68.0)
+            p.setPen(QPen(QColor(r_, g_, b_, 190 if long_ else 90), 1.4 if long_ else 1.0))
+            p.drawLine(QPointF(math.cos(a) * r0, math.sin(a) * r0), QPointF(math.cos(a) * r1, math.sin(a) * r1))
+        p.restore()
+        # core
+        rc = 15 + 13 * lvl + (1.5 * (1 + math.sin(t * 2.4)) if st != "SPEAKING" else 0)
+        cg = QRadialGradient(cx, cy, rc)
+        cg.setColorAt(0.0, QColor(255, 255, 255, 240))
+        cg.setColorAt(0.45, QColor(r_, g_, b_, 235))
+        cg.setColorAt(1.0, QColor(r_, g_, b_, 40))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(cg))
+        p.drawEllipse(QPointF(cx, cy), rc, rc)
+        # rings
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        pen = QPen(QColor(r_, g_, b_, 215), 2.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        a0 = int((t * spin) % 360 * 16)
+        rect = QRectF(cx - 40, cy - 40, 80, 80)
+        for q in range(3):
+            p.drawArc(rect, a0 + q * 120 * 16, 62 * 16)
+        pen.setWidthF(1.6)
+        pen.setColor(QColor(r_, g_, b_, 150))
+        p.setPen(pen)
+        a1 = int((-t * spin * 0.6) % 360 * 16)
+        rect2 = QRectF(cx - 52, cy - 52, 104, 104)
+        for q in range(2):
+            p.drawArc(rect2, a1 + q * 180 * 16, 100 * 16)
+        # two small satellites on the outer ring
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 235))
+        for q in range(2):
+            a = math.radians(-t * spin * 0.45 + q * 180)
+            p.drawEllipse(QPointF(cx + math.cos(a) * 52, cy + math.sin(a) * 52), 2.3, 2.3)
+        # voice bars
+        if st == "SPEAKING" or lvl > 0.04:
+            pen = QPen(QColor(r_, g_, b_, 235), 2.2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            n = 32
+            for i in range(n):
+                a = i * 2 * math.pi / n
+                wob = 0.35 + 0.65 * abs(math.sin(i * 1.9 + t * 11) * math.cos(i * 0.7 - t * 6))
+                ln = 3 + 17 * lvl * wob
+                c, s_ = math.cos(a), math.sin(a)
+                p.drawLine(QPointF(cx + c * 58, cy + s_ * 58), QPointF(cx + c * (58 + ln), cy + s_ * (58 + ln)))
+        # status pill: a pulsing dot + the state
+        f = font(8, QFont.Weight.Bold)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
+        p.setFont(f)
+        txt = f"JARVIS · {st}"
+        tw = p.fontMetrics().horizontalAdvance(txt) + 34
+        pill = QRectF((170 - tw) / 2, 166, tw, 22)
+        p.setPen(QPen(QColor(r_, g_, b_, 110), 1.0))
+        p.setBrush(QColor(6, 10, 18, 190))
+        p.drawRoundedRect(pill, 11, 11)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(r_, g_, b_, int(150 + 100 * (0.5 + 0.5 * math.sin(t * 4)))))
+        p.drawEllipse(QPointF(pill.left() + 12, pill.center().y()), 3.2, 3.2)
+        p.setPen(QColor(r_, g_, b_, 235))
+        p.drawText(QRectF(pill.left() + 20, pill.top(), pill.width() - 24, pill.height()), Qt.AlignmentFlag.AlignCenter, txt)
+
+
 class StageHost(QWidget):
 
     def __init__(self, stage: Stage3D, parent=None):
@@ -93,6 +678,7 @@ class StageHost(QWidget):
         stage.setParent(self)
         self.floats: dict[str, QWidget] = {}
         self.media_full = False
+        self.cam_full = False                           # the live camera covers the whole window
         self.float_parent: QWidget | None = None      # the floating panels (toast, alert, video…) are children of this widget …
         self.pages_ref: QStackedWidget | None = None   # … so they show on EVERY page, not only on Home
         self.on_layout = None
@@ -120,7 +706,9 @@ class StageHost(QWidget):
             c.setGeometry(X + 18, Y + H - h - 10, W - 36, h)
         m = self.floats.get("media")
         if m is not None and m.isVisible():
-            if self.media_full:
+            if self.cam_full and self.float_parent is not None:
+                m.setGeometry(0, 0, self.float_parent.width(), self.float_parent.height())
+            elif self.media_full:
                 m.setGeometry(X, Y, W, H)
             else:
                 media_w = min(960, max(360, min(int(W * 0.66), W - 28)))
@@ -143,6 +731,48 @@ class StageHost(QWidget):
         cb = self.on_layout
         if cb is not None:
             cb()                                           # the mpv window follows the panel at once, not on the next timer tick
+
+
+class _PageVeil(QWidget):
+    """A page change fades in: a dark veil in the background colour over the page area that dissolves in ~200 ms.
+    (No QGraphicsEffect: the page is not re-rendered into a buffer, only this one rectangle is painted.)"""
+
+    def __init__(self, page_area: QWidget):
+        super().__init__(page_area)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._a = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(1.0)
+        self._anim.setEndValue(0.0)
+        self._anim.setDuration(T.D_BASE)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on)
+        self._anim.finished.connect(self.hide)
+        self.hide()
+
+    def _on(self, v):
+        self._a = float(v)
+        self.update()
+
+    def play(self):
+        p = self.parentWidget()
+        if p is None or not p.isVisible():
+            return
+        self.setGeometry(0, 0, p.width(), p.height())
+        self._anim.stop()
+        self._a = 0.55
+        self.show()
+        self.raise_()
+        self._anim.setStartValue(0.55)
+        self._anim.start()
+
+    def paintEvent(self, _):
+        if self._a <= 0.01:
+            return
+        p = QPainter(self)
+        c = QColor(C.BG)
+        c.setAlpha(int(255 * self._a))
+        p.fillRect(self.rect(), c)
 
 
 class _PageWatch(QObject):
@@ -169,11 +799,59 @@ class FrameLabel(QLabel):
         super().__init__()
         self._img: QImage | None = None
         self._smooth = True
+        self.cover = False                       # True: fill the whole label (crop the overflow) instead of letterboxing
+        self.whole = False                       # True (workouts): always show the WHOLE picture, the sides filled with a blurred copy
+        self.shade = False                       # True (full-screen camera): soft shading at the top and bottom, viewfinder corners, LIVE badge
+        self._fps, self._fn, self._ft = 0.0, 0, time.monotonic()
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
-    def set_frame(self, img: QImage, smooth: bool = True):
-        self._img, self._smooth = img, smooth
+    def set_frame(self, img: QImage, smooth: bool = True, whole: bool = False):
+        self._img, self._smooth, self.whole = img, smooth, whole
+        self._fn += 1
+        now = time.monotonic()
+        if now - self._ft >= 0.6:
+            self._fps, self._fn, self._ft = self._fn / (now - self._ft), 0, now
         self.update()
+
+    def _chrome(self, p: QPainter, W: int, H: int, iw: int, ih: int):
+        """The full-screen camera dressing: soft shade top and bottom (so the HUD and captions read on any picture), thin
+        viewfinder corners, and a small LIVE badge with the real resolution and frame rate. A few cheap strokes per frame."""
+        k = max(0.75, min(1.6, H / 1080.0))
+        top = QLinearGradient(0, 0, 0, 120 * k)
+        top.setColorAt(0.0, QColor(0, 0, 0, 150))
+        top.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.fillRect(QRectF(0, 0, W, 120 * k), QBrush(top))
+        bot = QLinearGradient(0, H - 190 * k, 0, H)
+        bot.setColorAt(0.0, QColor(0, 0, 0, 0))
+        bot.setColorAt(1.0, QColor(0, 0, 0, 175))
+        p.fillRect(QRectF(0, H - 190 * k, W, 190 * k), QBrush(bot))
+        # viewfinder corners
+        col = qcol(C.PRI, 170)
+        pen = QPen(col, 2.2 * k)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        m, L = 16 * k, 34 * k
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for x, y, dx, dy in ((m, m, 1, 1), (W - m, m, -1, 1), (m, H - m, 1, -1), (W - m, H - m, -1, -1)):
+            p.drawLine(QPointF(x, y), QPointF(x + dx * L, y))
+            p.drawLine(QPointF(x, y), QPointF(x, y + dy * L))
+        if self.whole:
+            return                                # workouts: the HUD owns the top-left corner
+        # LIVE badge (top-left): red dot, resolution, fps
+        f = font(9, QFont.Weight.DemiBold)
+        p.setFont(f)
+        txt = f"LIVE  ·  {iw}×{ih}" + (f"  ·  {self._fps:.0f} fps" if self._fps > 0 else "")
+        tw = p.fontMetrics().horizontalAdvance(txt) + 40 * k
+        r = QRectF(32 * k, 30 * k, tw, 28 * k)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(QColor(8, 12, 22, 190))
+        p.drawRoundedRect(r, 14 * k, 14 * k)
+        pulse = 0.5 + 0.5 * math.sin(time.monotonic() * 4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 80, 90, int(150 + 105 * pulse)))
+        p.drawEllipse(QPointF(r.left() + 15 * k, r.center().y()), 4.5 * k, 4.5 * k)
+        p.setPen(QColor(235, 240, 250, 235))
+        p.drawText(QRectF(r.left() + 26 * k, r.top(), r.width() - 30 * k, r.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
 
     def clear(self):
         self._img = None
@@ -192,8 +870,33 @@ class FrameLabel(QLabel):
             super().paintEvent(e)
             return
         W, H = self.width(), self.height()
-        k = min(W / img.width(), H / img.height())
-        w, h = img.width() * k, img.height() * k
+        iw, ih = img.width(), img.height()
+        if self.whole:
+            # workouts need the whole body in view, so nothing is cropped: the picture is shown complete and the space left
+            # at the sides is filled with a dark, blurred copy of the same frame (a tiny copy scaled up = a cheap blur)
+            tiny = img.scaled(48, max(1, int(48 * ih / iw)), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            k0 = max(W / tiny.width(), H / tiny.height())
+            tw, th = tiny.width() * k0, tiny.height() * k0
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            p.drawImage(QRectF((W - tw) / 2, (H - th) / 2, tw, th), tiny)
+            p.fillRect(self.rect(), QColor(0, 0, 0, 140))
+            k = min(W / iw, H / ih)
+            w, h = iw * k, ih * k
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self._smooth and k < 1.6)
+            p.drawImage(QRectF((W - w) / 2, (H - h) / 2, w, h), img)
+            if self.shade:
+                self._chrome(p, W, H, iw, ih)
+            return
+        if self.cover:
+            k = max(W / iw, H / ih)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self._smooth and k < 1.6)
+            sw, sh = W / k, H / k                # the part of the picture that fits the label
+            p.drawImage(QRectF(0, 0, W, H), img, QRectF((iw - sw) / 2, (ih - sh) / 2, sw, sh))
+            if self.shade:
+                self._chrome(p, W, H, iw, ih)
+            return
+        k = min(W / iw, H / ih)
+        w, h = iw * k, ih * k
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self._smooth and k < 1.6)
         p.drawImage(QRectF((W - w) / 2, (H - h) / 2, w, h), img)
 
@@ -541,6 +1244,10 @@ class MainWindow(QMainWindow):
     _cam_stream_sig = pyqtSignal(bool)
     _cam_frame_sig = pyqtSignal(bytes)
     _cam_img_sig = pyqtSignal(object)
+    _cam_full_sig = pyqtSignal(bool)
+    _pushup_sig = pyqtSignal(object)
+    _pushup_full_sig = pyqtSignal(bool)
+    _celebrate_sig = pyqtSignal(str, str, str)
     _phone_frame_sig = pyqtSignal(str)
     _media_frame_sig = pyqtSignal(bytes, str)
     _mpv_open_sig = pyqtSignal(object)
@@ -576,7 +1283,10 @@ class MainWindow(QMainWindow):
         self.assistant_name = (cfg.get("assistant_name") or "JARVIS").strip() or "JARVIS"
         self.user_name = cfg.get("user_name") or ""
         col = (cfg.get("ui_color") or "").strip()
-        if col and col.lower() != DEFAULT_ACCENT:
+        theme = (cfg.get("ui_theme") or "").strip().lower()
+        if theme and apply_theme(theme):
+            pass                                              # a ready-made theme (Settings → Appearance)
+        elif col and col.lower() != DEFAULT_ACCENT:
             apply_accent(col)
         self.setStyleSheet(build_qss())
         self.setWindowTitle(self.assistant_name.upper())
@@ -606,6 +1316,11 @@ class MainWindow(QMainWindow):
         self._ptt_on = False
         self._ptt_down = False
         self._cam_run = False
+        self._cam_full = False
+        self._pushup_on = False                    # push-up frames are arriving in the media panel
+        self._pushup_want_full = False             # open the push-up view full screen as soon as its first frame arrives
+        self._cam_max = (1920, 1080)
+        self._cam_was_fs = False
         self._media_lock = threading.Lock()
         self._media_pending = None
         self._media_queued = False
@@ -644,6 +1359,10 @@ class MainWindow(QMainWindow):
         self._cam_stream_sig.connect(self._camera_toggle)
         self._cam_frame_sig.connect(self._camera_frame)
         self._cam_img_sig.connect(self._camera_image)
+        self._cam_full_sig.connect(self._cam_full_request)
+        self._pushup_sig.connect(self._pushup_stats)
+        self._pushup_full_sig.connect(self._pushup_full_request)
+        self._celebrate_sig.connect(self._celebrate)
         self._cam_pending = False
         self._cam_px = (640, 480)
         self._phone_frame_sig.connect(self._phone_frame)
@@ -900,13 +1619,27 @@ class MainWindow(QMainWindow):
 
         self._content = self._make_content()
         self._media = self._make_media()
+        self.mini = MiniJarvis(self.backdrop)
+        self.pushup_hud = PushupHUD(self.backdrop)
+        self._pu_fb = QLabel(self.backdrop)                    # push-up form tip, bottom-left of the full-screen view
+        self._pu_fb.setWordWrap(True)
+        self._pu_fb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._pu_fb_good = None
+        self._pu_fb.hide()
+        self.wk_left = WorkoutPanel(self.backdrop, "left")           # side panels in the free strips beside the picture
+        self.wk_right = WorkoutPanel(self.backdrop, "right")
+        self._wk_aspect = 16 / 9
+        self.celebration = CelebrationFX(self.backdrop)         # new personal record: confetti + big number
+        self._cam_caption_w = QLabel(self.backdrop)
+        self._cam_caption_w.setWordWrap(True)
+        self._cam_caption_w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._cam_caption_w.setStyleSheet("QLabel { background: rgba(6,10,18,175); color: #e8f1ff; border-radius: 14px; "
+                                          "padding: 10px 14px; font-size: 15px; }")
+        self._cam_caption_w.hide()
+        self._cam_caption_timer = QTimer(self)
+        self._cam_caption_timer.setSingleShot(True)
+        self._cam_caption_timer.timeout.connect(self._cam_caption_w.hide)
         self._clip = self._make_clip()
-        self._toast_w = GlassCard(self.backdrop, radius=18, tint=210, accent=C.PRI)
-        tl = QHBoxLayout(self._toast_w)
-        tl.setContentsMargins(16, 9, 16, 9)
-        self._toast_lbl = QLabel()
-        tl.addWidget(self._toast_lbl)
-        self._toast_w.hide()
         self._alert_w = GlassCard(self.backdrop, radius=26, tint=225, accent=C.RED)
         al = QVBoxLayout(self._alert_w)
         al.setContentsMargins(46, 26, 46, 26)
@@ -930,14 +1663,14 @@ class MainWindow(QMainWindow):
         self.host.float_parent = self.backdrop
         self.host.pages_ref = self.pages
         self.host.floats = {"content": self._content, "media": self._media,
-                            "clip": self._clip, "toast": self._toast_w, "alert": self._alert_w}
-        self.host.on_layout = lambda: self._mpv_win is not None and self._sync_mpv_geometry()
+                            "clip": self._clip, "alert": self._alert_w}
+        self.host.on_layout = self._on_host_layout
         self.pages.currentChanged.connect(lambda _i: self.host.layout_floats())
         _w = _PageWatch(self.host)
         self.pages.installEventFilter(_w)
-        self._toast_timer = QTimer(self)
-        self._toast_timer.setSingleShot(True)
-        self._toast_timer.timeout.connect(self._toast_w.hide)
+        self.toasts = ToastCenter(self.backdrop, self.host.area, self._front)      # the one notification system
+        self._veil = _PageVeil(self.pages)                                         # short fade-in when the page changes
+        self.pages.currentChanged.connect(lambda _i: self._veil.play())
         self._media_timer = QTimer(self)
         self._media_timer.setSingleShot(True)
         self._media_timer.timeout.connect(self._close_media)
@@ -1277,7 +2010,19 @@ class MainWindow(QMainWindow):
             w.update()
         self.title.update()
         if save:
-            patch_cfg(ui_color=C.PRI)
+            patch_cfg(ui_color=C.PRI, ui_theme="")            # a custom accent replaces the ready-made theme
+
+    def set_theme(self, key: str):
+        """Switch to a ready-made theme (Jarvis, Iron Man, Neon, Minimal, Emerald) — instantly, no restart."""
+        if not apply_theme(key):
+            return
+        self.setStyleSheet(build_qss())
+        for w in self.findChildren(QWidget):
+            w.update()
+        self.title.update()
+        self.backdrop._dirty = True
+        patch_cfg(ui_theme=current_theme(), ui_color=C.PRI)
+        self._toast(f"Theme: {key.replace('ironman', 'Iron Man').title()}")
 
     def set_model(self, name: str):
         self.stage.set_model(name)
@@ -2096,6 +2841,7 @@ class MainWindow(QMainWindow):
             self._state = s
         self.stage.state = s
         self.stage.speaking = s == "SPEAKING"
+        self.mini.state = "MUTED" if self._muted else s
         label = "MUTED" if self._muted else s
         col = getattr(C, self._STATE_COL.get(label, "PRI"))
         self.pill.set(label, col)
@@ -2124,6 +2870,7 @@ class MainWindow(QMainWindow):
                 self.chat.add("user", "", m.group(2))
             elif m:
                 self.chat.add("ai", m.group(1).strip(), m.group(2))
+                self._cam_caption(m.group(2))
             else:
                 self.chat.add("sys", "", text)
 
@@ -2146,12 +2893,7 @@ class MainWindow(QMainWindow):
         self.side.raise_()
 
     def _toast(self, msg: str):
-        self._toast_lbl.setText(msg)
-        self._toast_w.show()
-        self.host.layout_floats()
-        self._front(self._toast_w)
-        fade_in(self._toast_w, 200)
-        self._toast_timer.start(3200)
+        self.toasts.push(msg)
 
     def phone_event(self, event):
         if isinstance(event, dict):
@@ -2187,6 +2929,12 @@ class MainWindow(QMainWindow):
         if on and not self._cam_run:
             self._cam_run = True
             self._cam_pending = False
+            try:                                           # the biggest picture the monitor can show: the camera is asked for that size
+                scr = self.screen() or QApplication.primaryScreen()
+                dpr = scr.devicePixelRatio()
+                self._cam_max = (int(scr.size().width() * dpr), int(scr.size().height() * dpr))
+            except Exception:
+                self._cam_max = (1920, 1080)
             self._media_title.setText("CAMERA")
             self._media.show()
             self.host.layout_floats()
@@ -2196,6 +2944,180 @@ class MainWindow(QMainWindow):
             self._cam_run = False
             self._hide_media()
 
+    # ── full-screen camera ──
+    def _on_host_layout(self):
+        if self._mpv_win is not None:
+            self._sync_mpv_geometry()
+        self.toasts.relayout()
+        self._place_cam_overlays()
+
+    def _place_cam_overlays(self):
+        if not self._cam_full:
+            return
+        W, H = self.backdrop.width(), self.backdrop.height()
+        self.mini.place()
+        if self._pushup_on:
+            self.pushup_hud.place()
+            fb = self._pu_fb
+            fb.setFixedWidth(max(260, min(820, W - MiniJarvis.W - 70)))
+            fb.adjustSize()
+            fb.move(22, H - fb.height() - 22)
+            self.pushup_hud.raise_()
+            fb.raise_()
+            self._place_wk_panels()
+        cap = self._cam_caption_w
+        cap.setFixedWidth(max(240, min(760, W - MiniJarvis.W - 60)))
+        cap.adjustSize()
+        cap.move(18, H - cap.height() - 18)
+        self.mini.raise_()
+        cap.raise_()
+
+    def _place_wk_panels(self):
+        """Show the side panels only when the picture leaves free strips beside it (a 4:3 camera on a wide screen)."""
+        lbl, bd = self._media_lbl, self.backdrop
+        k = self.pushup_hud._k
+        pw = int(WorkoutPanel.BW * k)
+        top = lbl.mapTo(bd, QPoint(0, 0))
+        strip = (lbl.width() - lbl.height() * self._wk_aspect) / 2
+        room = strip >= pw + 14
+        hud_b = self.pushup_hud.y() + self.pushup_hud.height()
+        for panel in (self.wk_left, self.wk_right):
+            panel.scale_to(k)
+        ph = self.wk_left.height()
+        fits_l = room and hud_b + int(10 * k) + ph < bd.height() - int(80 * k)
+        fits_r = room and self.pushup_hud.y() + ph < bd.height() - int(MiniJarvis.H + 24)
+        if fits_l:
+            self.wk_left.move(int(top.x() + (strip - pw) / 2), hud_b + int(10 * k))
+        if fits_r:
+            self.wk_right.move(int(top.x() + lbl.width() - strip + (strip - pw) / 2), self.pushup_hud.y())
+        self.wk_left.setVisible(bool(fits_l))
+        self.wk_right.setVisible(bool(fits_r))
+        for w in (self.wk_left, self.wk_right):
+            if w.isVisible():
+                w.raise_()
+
+    def _cam_caption(self, text: str):
+        """While the camera is full screen, show what Jarvis just said (a solved task, its steps) next to the mini Jarvis."""
+        if not self._cam_full or self._pushup_on:            # (during push-ups the form tip label is used instead)
+            return
+        text = " ".join(str(text).split())
+        if not text:
+            return
+        if len(text) > 520:
+            text = text[:517] + "…"
+        self._cam_caption_w.setText(text)
+        self._cam_caption_w.show()
+        self._place_cam_overlays()
+        self._cam_caption_timer.start(30000)
+
+    def camera_fullscreen(self, on: bool):
+        self._cam_full_sig.emit(bool(on))
+
+    def _cam_full_request(self, on: bool):
+        if on and not self._cam_run and not self._pushup_on:
+            self._camera_toggle(True)                    # voice "fullscreen" with the camera still closed: open it first
+        self._set_cam_full(on)
+
+    def _set_cam_full(self, on: bool):
+        on = bool(on)
+        if on == self._cam_full or (on and not (self._cam_run or self._pushup_on)):
+            return
+        self._cam_full = on
+        self.host.cam_full = on
+        lay = self._media.layout()
+        if on:
+            self._cam_was_fs = self.isFullScreen()
+            self._media_lbl.cover = True                 # fill the whole screen, no black bars
+            self._media_lbl.shade = True
+            if not self._cam_was_fs:
+                self.showFullScreen()
+            self.side.hide()
+            lay.setContentsMargins(6, 4, 6, 6)
+            self._media_full_btn.setToolTip("Exit full screen (Esc)")
+            self._set_media_scene(True)                  # the animated HUD behind the camera is hidden anyway: stop drawing it
+            self.host.layout_floats()
+            self._media.raise_()
+            self.mini.activate(True)
+            if self._pushup_on:
+                self.pushup_hud.show()
+                self._pu_fb.show()
+            self._place_cam_overlays()
+        else:
+            self._media_lbl.cover = False
+            self._media_lbl.shade = False
+            self.pushup_hud.hide()
+            self.wk_left.hide()
+            self.wk_right.hide()
+            self._pu_fb.hide()
+            self.mini.activate(False)
+            self._cam_caption_timer.stop()
+            self._cam_caption_w.hide()
+            lay.setContentsMargins(12, 10, 10, 12)
+            self._media_full_btn.setToolTip("Full screen (Esc to exit)")
+            self.side.show()
+            self.side.raise_()
+            if not self._cam_was_fs and self.isFullScreen():
+                self.showNormal()
+            self._set_media_scene(False)
+            self.host.layout_floats()
+
+    def camera_is_open(self) -> bool:
+        return bool(self._cam_run)
+
+    # ── push-up counter view ──
+    def pushup_stats(self, d: dict):
+        self._pushup_sig.emit(dict(d))
+
+    def pushup_fullscreen(self, on: bool):
+        self._pushup_full_sig.emit(bool(on))
+
+    def celebrate(self, title: str, big: str, sub: str = ""):
+        self._celebrate_sig.emit(str(title), str(big), str(sub))
+
+    def _celebrate(self, title: str, big: str, sub: str):
+        self.celebration.setGeometry(0, 0, self.backdrop.width(), self.backdrop.height())
+        self.celebration.play(title, big, sub)
+
+    def pushup_hud_active(self) -> bool:
+        """True while the big HUD counter is on screen: the session then leaves the numbers out of the picture itself."""
+        return bool(self._cam_full and self._pushup_on)
+
+    def _pushup_full_request(self, on: bool):
+        if self._pushup_on:
+            self._set_cam_full(on)
+        else:
+            self._pushup_want_full = on                # the first frame has not arrived yet
+
+    def _pushup_stats(self, d: dict):
+        if not self._pushup_on:
+            return
+        self.pushup_hud.set_stats(d)
+        self.wk_left.set_stats(d)
+        self.wk_right.set_stats(d)
+        fb = str(d.get("feedback", ""))[:90]
+        good = (bool(d.get("ok", False)) or d.get("mode") == "rest") and any(k in fb for k in ("clean", "Good", "Ready", "Strong", "Hold", "Chin over", "Rest"))
+        if fb != self._pu_fb.text() or good != self._pu_fb_good:
+            self._pu_fb_good = good
+            col = "92,255,176" if good else "255,200,87"
+            self._pu_fb.setStyleSheet(f"QLabel {{ background: rgba(6,10,18,185); color: rgb({col}); border-radius: 14px; "
+                                      f"border: 1px solid rgba({col},120); padding: 10px 16px; font-size: 20px; font-weight: 600; }}")
+            self._pu_fb.setText(fb)
+            if self._cam_full:
+                self._place_cam_overlays()
+
+    def shared_camera(self):
+        """The one CameraHub (hands, Face ID, preview) — other features borrow its frames instead of opening the camera again."""
+        try:
+            hub = self._camera_hub()
+            hub.max_size = self._cam_max
+            return hub
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def grab_camera_jpeg(self):
+        hub = self.camera
+        return hub.snapshot_jpeg() if (hub is not None and self._cam_run) else None
+
     def _cam_worker(self):
         """Camera preview: the frame is converted and shrunk to the panel's size here, in the worker, and handed over as a QImage
         (no JPEG encode + decode, no scaling on the GUI thread). A frame is only sent when the previous one has been shown."""
@@ -2204,6 +3126,7 @@ class MainWindow(QMainWindow):
             import cv2
             try:
                 hub = self._camera_hub()                       # one camera for everything: hand tracking, face lock and this preview
+                hub.max_size = self._cam_max
                 hub.preview = True
                 hub.refresh()
             except Exception:                                  # noqa: BLE001
@@ -2211,6 +3134,9 @@ class MainWindow(QMainWindow):
             if hub is not None:
                 t0, last, started = time.time(), None, False
                 while self._cam_run:
+                    if self.isMinimized():                    # nobody can see the picture: don't convert frames for it
+                        time.sleep(0.25)
+                        continue
                     frame = hub.latest
                     if frame is None or frame is last:
                         if not started and not hub.running and time.time() - t0 > 3.0:
@@ -2221,7 +3147,7 @@ class MainWindow(QMainWindow):
                     if not self._cam_pending:
                         tw, th = self._cam_px
                         h, w = frame.shape[:2]
-                        k = min(tw / w, th / h, 1.0)
+                        k = min(max(tw / w, th / h) if self._cam_full else min(tw / w, th / h), 1.0)   # full screen: size for the crop that fills it
                         if k < 0.98:
                             frame = cv2.resize(frame, (max(1, int(w * k)), max(1, int(h * k))), interpolation=cv2.INTER_AREA)
                             h, w = frame.shape[:2]
@@ -2262,7 +3188,7 @@ class MainWindow(QMainWindow):
         lbl = self._media_lbl
         self._cam_px = (max(160, lbl.width()), max(120, lbl.height()))
         if self._media.isVisible() and isinstance(img, QImage):
-            lbl.set_frame(img, smooth=False)               # already the right size: a straight copy to the screen
+            lbl.set_frame(img, smooth=img.width() < lbl.width() - 2 and img.height() < lbl.height() - 2)   # same size: straight copy; bigger label: smooth upscale
 
     def _camera_frame(self, data: bytes):
         img = QImage.fromData(data)
@@ -2311,6 +3237,7 @@ class MainWindow(QMainWindow):
         data, title = pending
         if not data:
             if not self._cam_run:
+                self._pushup_want_full = False
                 self._hide_media()
             return
         if self._cam_run:
@@ -2325,9 +3252,23 @@ class MainWindow(QMainWindow):
             self._media_title.setText(title or "VIDEO")
             self._media.show()
             self.host.layout_floats()
+        pushups = title in WORKOUT_TITLES
+        if pushups and not self._pushup_on:
+            self._pushup_on = True
+            self.pushup_hud.reset()
+            if self._pushup_want_full:
+                self._pushup_want_full = False
+                self._set_cam_full(True)
         self._set_media_scene(True)
-        self._front(self._media)
-        self._media_lbl.set_frame(img, smooth=False)
+        if not self._cam_full:
+            self._front(self._media)
+        if img.height():
+            asp = img.width() / img.height()
+            if abs(asp - self._wk_aspect) > 0.01:
+                self._wk_aspect = asp
+                if self._cam_full and self._pushup_on:
+                    self._place_cam_overlays()
+        self._media_lbl.set_frame(img, smooth=pushups, whole=pushups)
         self._media_timer.stop()  # video panel is closed by the player (empty frame) or the user, not by a timeout
 
     # ── mpv video: a native window floats over the media panel and mpv draws into it ──
@@ -2646,6 +3587,14 @@ class MainWindow(QMainWindow):
             self._hide_media()
 
     def _hide_media(self):
+        if self._cam_full:
+            self._set_cam_full(False)
+        self._pushup_on = False
+        self._media_lbl.whole = False
+        self.pushup_hud.hide()
+        self.wk_left.hide()
+        self.wk_right.hide()
+        self._pu_fb.hide()
         self._mpv_close()
         self._set_media_scene(False)
         self._media.hide()
@@ -2653,6 +3602,8 @@ class MainWindow(QMainWindow):
     def _toggle_media_full(self):
         vw = self._mpv_win
         if vw is None:
+            if self._cam_run or self._pushup_on:
+                self._set_cam_full(not self._cam_full)      # the live camera / push-ups: full window with the mini Jarvis in the corner
             return
         if vw.isFullScreen():
             vw.showNormal()
@@ -2684,6 +3635,12 @@ class MainWindow(QMainWindow):
 
     def _close_media_user(self):
         self._cam_run = False
+        if self._pushup_on:                                    # closing the push-up view ends the workout (the camera must not stay on unseen)
+            try:
+                from actions.pushup_counter import stop_session
+                stop_session()
+            except Exception:
+                pass
         try:
             from actions.hud_video import stop_hud_video
             stop_hud_video()
@@ -2779,6 +3736,8 @@ class MainWindow(QMainWindow):
             self.enter_compact()
         elif self._mpv_win is not None and not self.modal.is_open() and self._video_key(e):
             pass
+        elif k == Qt.Key.Key_Escape and self._cam_full:
+            self._set_cam_full(False)
         elif k == Qt.Key.Key_Escape and self.host.media_full:
             self._exit_media_full()
         elif k == Qt.Key.Key_Escape and self.isFullScreen() and not self.modal.is_open():
@@ -2806,6 +3765,8 @@ class MainWindow(QMainWindow):
             self._lock_screen.cover()
         if getattr(self, "_mpv_win", None) is not None:
             self._sync_mpv_geometry()
+        if getattr(self, "_cam_full", False):
+            self.host.layout_floats()
 
     def moveEvent(self, e):
         super().moveEvent(e)
@@ -2906,6 +3867,8 @@ class JarvisUI:
 
     def set_audio_level(self, level: float):
         self._win.stage.set_audio_level(level)
+        if self._win._cam_full:
+            self._win.mini.push(float(level))
         if self._win._compact is not None:
             self._win._compact.amp = max(0.0, min(1.0, float(level)))
 
@@ -2920,6 +3883,34 @@ class JarvisUI:
 
     def stop_camera_stream(self):
         self._win.stop_camera_stream()
+
+    def camera_fullscreen(self, on: bool):
+        self._win.camera_fullscreen(on)
+
+    def notify(self, text: str):
+        """A short on-screen message (toast) from any thread."""
+        self._win._toast_sig.emit(str(text))
+
+    def show_pushup_stats(self, d: dict):
+        self._win.pushup_stats(d)
+
+    def pushup_fullscreen(self, on: bool):
+        self._win.pushup_fullscreen(on)
+
+    def pushup_hud_active(self) -> bool:
+        return self._win.pushup_hud_active()
+
+    def celebrate(self, title: str, big: str, sub: str = ""):
+        self._win.celebrate(title, big, sub)
+
+    def camera_is_open(self) -> bool:
+        return self._win.camera_is_open()
+
+    def grab_camera_jpeg(self):
+        return self._win.grab_camera_jpeg()
+
+    def shared_camera(self):
+        return self._win.shared_camera()
 
     def show_phone_screen_frame(self, b64: str):
         self._win.show_phone_screen_frame(b64)

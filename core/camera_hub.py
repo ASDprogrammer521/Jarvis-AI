@@ -24,6 +24,19 @@ KNOWN_COOLDOWN = 45.0     # don't greet the same person again within this many s
 UNKNOWN_COOLDOWN = 60.0
 ENROLL_SAMPLES = 6
 ENROLL_TIMEOUT = 20.0
+MODEL_W = 640             # hand / face models always get a picture this wide, however big the camera frame is
+SIZE_LADDER = [(1920, 1080), (1280, 720), (640, 480)]   # live view: the biggest of these the camera AND the monitor can use
+IDLE_SIZE = (640, 480)       # no live view: gestures and faces don't need more
+
+
+
+def _safe_release(obj) -> None:
+    """cap.release() can raise "Unknown C++ exception from OpenCV code" when the driver is already gone (camera unplugged, GPU
+    switching on laptops): that must never kill the camera thread or print a traceback."""
+    try:
+        obj.release()
+    except Exception:
+        pass
 
 
 class _HandWorker(threading.Thread):
@@ -202,7 +215,9 @@ class CameraHub:
         self.on_hand = on_hand or (lambda pts, pinch: None)           # hand skeleton for the overlay
         self.on_space = on_space or (lambda hands: None)              # Hand Space: landmarks of every hand in view
         self.space = False                                            # set by the window while Hand Space is open
-        self.preview = False                                          # set while the camera preview panel is open: frames are shared, not opened twice
+        self._preview = False                                         # set while the camera preview panel is open: frames are shared, not opened twice
+        self._claims: set[str] = set()                                # other users of the picture (the workout counter): same HD frames, one camera
+        self.max_size: tuple[int, int] | None = None                  # monitor size: the live view never asks the camera for more than fits it
         self.latest = None                                            # newest BGR frame, for the preview panel (read-only: never change it)
         self._hand_seen = 0.0                                         # last time any hand was in view
         self.on_face = on_face
@@ -218,6 +233,36 @@ class CameraHub:
         self.current_gesture: str | None = None
         self.visible: list[str] = []        # names (or "unknown") seen in the last face check
         self.seen_at = 0.0
+
+    @property
+    def preview(self) -> bool:
+        """True while anyone needs the shared HD picture (the preview panel or a claim, e.g. the workout counter)."""
+        return self._preview or bool(self._claims)
+
+    @preview.setter
+    def preview(self, on: bool):
+        self._preview = bool(on)
+
+    def claim(self, who: str) -> None:
+        """Ask for the shared picture (hub.latest) without opening a second capture: Windows lets one program own a camera."""
+        with self._lock:
+            self._claims.add(who)
+
+    def release(self, who: str) -> None:
+        with self._lock:
+            self._claims.discard(who)
+
+    def snapshot_jpeg(self, max_w: int = 1280, quality: int = 88) -> bytes | None:
+        """The newest preview frame as a JPEG, or None while the live view has no picture yet (used by the vision tool)."""
+        frame = self.latest
+        if frame is None:
+            return None
+        import cv2
+        h, w = frame.shape[:2]
+        if w > max_w:
+            frame = cv2.resize(frame, (max_w, max(1, int(h * max_w / w))), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return buf.tobytes() if ok else None
 
     # ── control ──────────────────────────────────────────────────────────────────
     @property
@@ -268,24 +313,41 @@ class CameraHub:
             pass
 
     # ── loop ─────────────────────────────────────────────────────────────────────
-    def _open(self):
+    def _sizes(self, hd: bool):
+        if not hd:
+            return [IDLE_SIZE]
+        mw = max(1280, (self.max_size or (1280, 720))[0])
+        return [sz for sz in SIZE_LADDER if sz[0] <= mw] or [SIZE_LADDER[-1]]
+
+    def _open(self, hd: bool = False):
         import cv2
         idx = gesture.get_camera()
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(idx)
         if not cap.isOpened():
-            cap.release()
+            _safe_release(cap)
             raise RuntimeError("camera is busy or not found")
         try:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))   # much faster than raw frames on most webcams
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)                              # always the newest frame, no lag
+            # Ask for the biggest size first and keep the first one the camera really delivers (a driver may accept the
+            # request and still send something smaller, so the size is checked on a real frame, not on cap.get()).
+            for w, h in self._sizes(hd):
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                got = 0
+                for _ in range(4):
+                    ok, f = cap.read()
+                    if ok and f is not None:
+                        got = f.shape[1]
+                if got >= w * 0.9:
+                    break
         except Exception:
             pass
         return cap
 
     def _run(self):
         cap = hands = faceworker = worker = None
+        hd = False
         tracker = gesture.GestureTracker()
         cursor = None
         last_face = 0.0
@@ -296,11 +358,16 @@ class CameraHub:
         try:
             self._set("starting…")
             import cv2
-            cap = self._open()
+            hd = self.preview                                  # open at the right size at once (no open → close → reopen)
+            cap = self._open(hd)
             self._set("active")
             while not self._stop.is_set():
                 if not self._wanted():
                     break
+                if self.preview != hd:                 # live view opened / closed: reopen the camera at the right size
+                    hd = self.preview
+                    _safe_release(cap)
+                    cap = self._open(hd)
                 if faceworker is not None and faceworker.error is not None:
                     raise faceworker.error             # the face thread failed (missing model, old OpenCV…): show it as the camera status
                 # Skip frames nobody needs: grab() drops a frame without decoding it, so the hand / face models stay idle
@@ -332,6 +399,11 @@ class CameraHub:
                 if self.preview:
                     self.latest = frame
                     last_prev = now
+                # the models never see more than MODEL_W pixels across: HD frames are for the picture on screen only
+                fw = frame.shape[1]
+                work = frame
+                if fw > MODEL_W + 60 and (hand_due or face_due):
+                    work = cv2.resize(frame, (MODEL_W, max(1, int(frame.shape[0] * MODEL_W / fw))), interpolation=cv2.INTER_AREA)
 
                 # ── hands: Hand Space (two hands) > cursor mode (hand = mouse) > one-shot gestures ──
                 if hands_on and not hand_due:
@@ -363,7 +435,7 @@ class CameraHub:
                         if worker.error is not None:
                             raise worker.error
                         if worker.ready():
-                            worker.submit(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                            worker.submit(cv2.cvtColor(work, cv2.COLOR_BGR2RGB))
                         self.current_gesture = None
                         if PROFILE:
                             _prof[1] += 1
@@ -372,7 +444,7 @@ class CameraHub:
                                       f"({worker.frames} processed)")
                                 _prof[1] = 0
                     else:
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
                         lm = hands.detect(rgb)
                         if lm:
                             self._hand_seen = now
@@ -409,7 +481,7 @@ class CameraHub:
                             faceworker = _FaceWorker(self)
                             faceworker.start()
                         last_face = now
-                        faceworker.submit(frame, now)
+                        faceworker.submit(work, now)
                 elif faceworker is not None:
                     faceworker.stop()
                     faceworker = None
@@ -425,9 +497,9 @@ class CameraHub:
         finally:
             self.latest = None
             if cap is not None:
-                cap.release()
+                _safe_release(cap)
             if cursor is not None:
-                cursor.release()
+                _safe_release(cursor)
                 (self.on_hand(None, 0.0), self.on_cursor(0, 0, "lost"))
             if worker is not None:
                 worker.stop()

@@ -657,6 +657,152 @@ class MusicCard(GlassCard):
         threading.Thread(target=work, daemon=True).start()
 
 
+# ─────────────────────────── Workouts: weekly chart + records ───────────────────────────
+_EX_COLORS = {"pushup": "#ffd666", "squat": "#5cffb0", "situp": "#ff9f50", "pullup": "#ff78aa"}
+
+
+class WeekChart(QWidget):
+    """Seven stacked bars (one colour per exercise), today highlighted; the bars grow in when the data changes."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows: list[dict] = []
+        self._grow = 1.0
+        self.setMinimumHeight(150)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(700)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_grow)
+
+    def _on_grow(self, v):
+        self._grow = float(v)
+        self.update()
+
+    def set_rows(self, rows: list[dict]):
+        changed = [(r["date"], r["total"]) for r in rows] != [(r["date"], r["total"]) for r in self.rows]
+        self.rows = rows
+        if changed:
+            self._anim.stop()
+            self._anim.start()
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        rows = self.rows
+        if not rows:
+            return
+        top, bottom = 18, 22
+        ch = H - top - bottom
+        peak = max([r["total"] for r in rows] + [1])
+        n = len(rows)
+        slot = W / n
+        bw = min(46.0, slot * 0.58)
+        dim = qcol(C.TEXT_DIM)
+        p.setPen(QPen(QColor(255, 255, 255, 26), 1))
+        p.drawLine(0, H - bottom, W, H - bottom)
+        for i, r in enumerate(rows):
+            cx = slot * (i + 0.5)
+            x = cx - bw / 2
+            y = H - bottom
+            for ex in ("pushup", "squat", "situp", "pullup"):
+                v = r["by"].get(ex, 0)
+                if not v:
+                    continue
+                h = ch * v / peak * self._grow
+                y -= h
+                col = QColor(_EX_COLORS[ex])
+                if not r["today"]:
+                    col.setAlpha(205)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(col)
+                p.drawRoundedRect(QRectF(x, y, bw, max(2.0, h - 1.5)), 5, 5)
+            if r["total"]:
+                p.setPen(qcol(C.TEXT))
+                p.setFont(font(8, QFont.Weight.DemiBold))
+                p.drawText(QRectF(cx - slot / 2, y - 17, slot, 15), Qt.AlignmentFlag.AlignCenter, str(r["total"]))
+            elif r["plank_s"] == 0:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 255, 255, 30))
+                p.drawRoundedRect(QRectF(x, H - bottom - 3, bw, 3), 1.5, 1.5)
+            if r["plank_s"]:                                   # plank is time, not reps: a small badge under the bar's top
+                p.setPen(QColor(120, 200, 255))
+                p.setFont(font(7, QFont.Weight.DemiBold))
+                p.drawText(QRectF(cx - slot / 2, y - (30 if r["total"] else 17), slot, 13),
+                           Qt.AlignmentFlag.AlignCenter, f"⏱{r['plank_s'] // 60}:{r['plank_s'] % 60:02d}")
+            p.setPen(qcol(C.PRI) if r["today"] else dim)
+            f = font(8, QFont.Weight.Bold if r["today"] else QFont.Weight.Normal)
+            p.setFont(f)
+            p.drawText(QRectF(cx - slot / 2, H - bottom + 4, slot, 16), Qt.AlignmentFlag.AlignCenter, r["label"])
+
+
+class WorkoutCard(GlassCard):
+    """Weekly chart + personal records + streak, from memory/workouts.json (refreshes by itself when a workout is saved)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, radius=24, tint=140)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(8)
+        head = QHBoxLayout()
+        head.addWidget(_title("Workouts · last 7 days"))
+        head.addStretch()
+        self.summary = QLabel("")
+        self.summary.setStyleSheet(f"color: {C.TEXT_DIM};")
+        head.addWidget(self.summary)
+        lay.addLayout(head)
+        self.chart = WeekChart()
+        lay.addWidget(self.chart)
+        self.legend = QLabel("")
+        self.legend.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(self.legend)
+        self.records = QLabel("")
+        self.records.setTextFormat(Qt.TextFormat.RichText)
+        self.records.setWordWrap(True)
+        lay.addWidget(self.records)
+        self.empty = QLabel("No workouts yet — say “Jarvis, let's do push-ups” or “3 sets of 15 squats”.")
+        self.empty.setStyleSheet(f"color: {C.TEXT_DIM};")
+        self.empty.setWordWrap(True)
+        lay.addWidget(self.empty)
+        self._stamp = None
+        self.refresh(force=True)
+
+    def refresh(self, force: bool = False):
+        try:
+            from core import workout_stats as ws
+            stamp = ws.mtime()
+            today = time.strftime("%Y-%m-%d")
+            if not force and stamp == self._stamp and today == getattr(self, "_day", None):
+                return
+            self._stamp, self._day = stamp, today
+            sess = ws.load_sessions()
+            rows = ws.week_series(7, sessions=sess)
+            self.chart.set_rows(rows)
+            summ = ws.week_summary(sessions=sess)
+            has = bool(sess)
+            self.empty.setVisible(not has)
+            self.chart.setVisible(has)
+            self.legend.setVisible(has)
+            self.records.setVisible(has)
+            self.summary.setText(f"{summ['reps']} reps · {summ['active_days']} active days · 🔥 {summ['streak']}-day streak" if has else "")
+            self.legend.setText("&nbsp;&nbsp;".join(
+                f"<span style='color:{_EX_COLORS[e]}'>●</span> <span style='color:{C.TEXT_DIM}'>{ws.NAMES[e]}</span>"
+                for e in ("pushup", "squat", "situp", "pullup")))
+            rec = ws.records(sess)
+            if rec:
+                bits = [f"<span style='color:{C.TEXT_DIM}'>🏆 Records:</span>"]
+                for e in ws.EXERCISES:
+                    if e in rec:
+                        v = ws.fmt_value(e, rec[e]["value"])
+                        bits.append(f"<b style='color:{C.TEXT}'>{ws.NAMES[e]} {v}</b>")
+                self.records.setText("&nbsp;&nbsp;·&nbsp;&nbsp;".join(bits))
+        except Exception:
+            pass
+
+
 class DashboardPage(QWidget):
     quick = pyqtSignal(str)
     toast = pyqtSignal(str)
@@ -666,7 +812,7 @@ class DashboardPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
-        outer.addWidget(PageHeader("Dashboard", "System, tasks, activity and music at a glance"))
+        outer.addWidget(PageHeader("Dashboard", "System, tasks, workouts, activity and music at a glance"))
         sc = QScrollArea()
         sc.setWidgetResizable(True)
         sc.setFrameShape(QFrame.Shape.NoFrame)
@@ -682,16 +828,18 @@ class DashboardPage(QWidget):
         self.tasks = TasksCard()
         self.activity = ActivityCard()
         self.music = MusicCard()
+        self.workouts = WorkoutCard()
         self.quick_card.triggered.connect(self.quick.emit)
         self.music.toast.connect(self.toast.emit)
         g.addWidget(self.quick_card, 0, 0)
         g.addWidget(self.perf, 0, 1)
         g.addWidget(self.tasks, 1, 0)
         g.addWidget(self.activity, 1, 1)
-        g.addWidget(self.music, 2, 0, 1, 2)
+        g.addWidget(self.workouts, 2, 0, 1, 2)
+        g.addWidget(self.music, 3, 0, 1, 2)
         g.setColumnStretch(0, 1)
         g.setColumnStretch(1, 1)
-        g.setRowStretch(3, 1)
+        g.setRowStretch(4, 1)
         sc.setWidget(body)
         outer.addWidget(sc)
 
@@ -700,6 +848,7 @@ class DashboardPage(QWidget):
         self._n = getattr(self, "_n", 0) + 1
         if self._n % 15 == 0:
             self.activity.refresh()
+            self.workouts.refresh()
 
 
 # ─────────────────────────── Phone page (Phone Link style) ───────────────────────────

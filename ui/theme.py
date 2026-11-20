@@ -29,6 +29,41 @@ class C:
     TEXT_DIM = "#6b74a6"
 
 
+_FIXED = {n: getattr(C, n) for n in ("TEXT", "GREEN", "AMBER", "RED")}      # colours a theme may override but the accent never touches
+
+
+class T:
+    """Design tokens: the one place for corner radii, spacing, type sizes and animation timings.
+
+    New widgets take their numbers from here (and their colours from C), so everything stays consistent and a change
+    is made once. Pair it with `card_css()` / `button_css()` below for QSS-styled widgets."""
+    # corner radii
+    R_XS, R_SM, R_MD, R_LG, R_XL, R_PILL = 6, 10, 14, 22, 28, 999
+    # spacing scale (px)
+    S1, S2, S3, S4, S5, S6 = 4, 8, 12, 16, 24, 32
+    # type scale (points)
+    F_CAPTION, F_BODY, F_LABEL, F_TITLE, F_HEADING, F_DISPLAY = 8, 10, 11, 13, 18, 28
+    # animation (ms): quick feedback, normal transitions, larger moves
+    D_FAST, D_BASE, D_SLOW = 150, 200, 250
+    # elevation: how opaque glass cards are (0-255)
+    TINT_LOW, TINT_MID, TINT_HIGH = 140, 190, 225
+
+
+def card_css(selector: str = "QFrame", radius: int | None = None, accent: bool = False) -> str:
+    """A glass-card look as QSS (for plain widgets that are not GlassCard)."""
+    r = T.R_LG if radius is None else radius
+    edge = rgba(C.PRI, .38) if accent else rgba("#ffffff", .10)
+    return (f"{selector} {{ background: {rgba(C.PANEL, .82)}; border: 1px solid {edge}; border-radius: {r}px; }}")
+
+
+def button_css(selector: str = "QPushButton", primary: bool = False) -> str:
+    base = rgba(C.PRI, .22) if primary else rgba("#ffffff", .07)
+    hov = rgba(C.PRI, .38) if primary else rgba("#ffffff", .13)
+    return (f"{selector} {{ background: {base}; color: {C.TEXT}; border: 1px solid {rgba(C.PRI, .45) if primary else rgba('#ffffff', .12)};"
+            f" border-radius: {T.R_MD}px; padding: {T.S2}px {T.S4}px; font-weight: 600; }}"
+            f"{selector}:hover {{ background: {hov}; }}")
+
+
 def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h)
     c.setAlpha(max(0, min(255, int(a))))
@@ -74,10 +109,53 @@ def apply_accent(hex_color: str) -> bool:
     return True
 
 
+# ── ready-made themes ──────────────────────────────────────────────────────────────────────────────────────────────────────
+# Each theme is an accent colour (everything else — backgrounds, panels, borders, text — is derived from it exactly like the
+# accent picker does) plus optional explicit overrides for the palette colours that should not follow the accent.
+THEMES: dict[str, dict] = {
+    "jarvis":   {"label": "Jarvis",   "accent": DEFAULT_ACCENT, "over": {}},
+    "ironman":  {"label": "Iron Man", "accent": "#ff4a3d",
+                 "over": {"ACC": "#ffc857", "ACC2": "#ff8a3d", "PRI": "#ffb23d", "PRI_DIM": "#c8791c", "PRI_GHO": "#3a1d0c",
+                           "BG": "#0a0505", "BG2": "#140a08", "PANEL": "#1f100d", "PANEL2": "#2a1612",
+                           "BORDER": "#4a2a22", "BORDER_B": "#7a4636"}},
+    "neon":     {"label": "Neon",     "accent": "#00f0ff",
+                 "over": {"ACC": "#ff2bd6", "ACC2": "#b6ff3b", "PRI": "#00f0ff", "PRI_DIM": "#00a9b5", "PRI_GHO": "#06303a",
+                           "BG": "#05020d", "BG2": "#0a0618", "PANEL": "#120a2a", "PANEL2": "#1b1040",
+                           "BORDER": "#35206b", "BORDER_B": "#5b34b8"}},
+    "minimal":  {"label": "Minimal",  "accent": "#dcdcdc",
+                 "over": {"ACC": "#9aa0a6", "ACC2": "#ffffff", "PRI": "#f2f2f2", "PRI_DIM": "#a8a8a8", "PRI_GHO": "#262626",
+                           "BG": "#050505", "BG2": "#0b0b0b", "PANEL": "#141414", "PANEL2": "#1c1c1c",
+                           "BORDER": "#2b2b2b", "BORDER_B": "#444444",
+                           "TEXT": "#f4f4f4", "TEXT_MED": "#b5b5b5", "TEXT_DIM": "#7a7a7a"}},
+    "emerald":  {"label": "Emerald",  "accent": "#2ee6a6", "over": {}},
+}
+THEME_ORDER = ("jarvis", "ironman", "neon", "minimal", "emerald")
+_THEME = {"key": "jarvis"}
+
+
+def apply_theme(key: str) -> bool:
+    """Switch the whole palette to a ready-made theme. Returns False for an unknown name."""
+    key = (key or "").strip().lower()
+    th = THEMES.get(key)
+    if th is None:
+        return False
+    for name, value in _FIXED.items():
+        setattr(C, name, value)
+    apply_accent(th["accent"])
+    for name, value in th["over"].items():
+        setattr(C, name, value)
+    _THEME["key"] = key
+    return True
+
+
+def current_theme() -> str:
+    return _THEME["key"]
+
+
 def build_qss() -> str:
     return f"""
     QToolTip {{ background: {C.PANEL2}; color: {C.TEXT}; border: 1px solid {C.BORDER_B};
-        border-radius: 8px; padding: 5px 9px; }}
+        border-radius: {T.R_SM - 2}px; padding: 5px 9px; }}
     QLabel {{ background: transparent; color: {C.TEXT}; }}
     QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
@@ -87,7 +165,7 @@ def build_qss() -> str:
     QPushButton:focus {{ outline: none; }}
     QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{ background: none; height: 0; }}
     QLineEdit {{ background: {rgba('#ffffff', .05)}; color: {C.TEXT}; border: 1px solid {rgba('#ffffff', .10)};
-        border-radius: 12px; padding: 9px 14px; selection-background-color: {C.PRI_DIM}; }}
+        border-radius: {T.R_MD - 2}px; padding: 9px 14px; selection-background-color: {C.PRI_DIM}; }}
     QLineEdit:focus {{ border: 1px solid {C.PRI}; background: {rgba('#ffffff', .09)}; }}
     QComboBox {{ background: {rgba('#ffffff', .06)}; color: {C.TEXT}; border: 1px solid {rgba('#ffffff', .10)};
         border-radius: 10px; padding: 6px 12px; }}
