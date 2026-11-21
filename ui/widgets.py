@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import math
+import os
+import re
 import time
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QVariantAnimation, QEasingCurve, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, QSize, QUrl, Qt, QTimer, QVariantAnimation, QEasingCurve, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QConicalGradient,
+    QBrush, QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QConicalGradient, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from ui.fx import GlassCard, Toggle, fade_in, mix
@@ -386,7 +388,274 @@ class MetricTile(QWidget):
         p.drawText(QRectF(0, self.ring + 14, self.width(), 20), Qt.AlignmentFlag.AlignCenter, self.label)
 
 
+# ── chat: markdown, code blocks with Copy, typing indicator, file / image previews, reactions ─────────────────────────
+
+_FENCE = re.compile(r"```[ \t]*([\w+#.\-]*)[^\n]*\n?(.*?)(?:```|\Z)", re.S)
+_IMG_EXT = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+# never offer a one-click "open" for anything that can run code
+_RISKY_EXT = {"exe", "bat", "cmd", "com", "msi", "scr", "ps1", "vbs", "vbe", "js", "jse", "jar", "lnk", "sh", "app", "dll",
+              "reg", "hta", "cpl", "pif", "wsf", "py", "pyw", "appx", "msix", "iso"}
+_PATH_RE = re.compile(r"""(?:(?<![\w])[A-Za-z]:[\\/][^\s"'<>|*?`]+|(?<![\w:/.])(?:~|/)[^\s"'<>|*?`]+)""")
+
+
+def _split_blocks(text: str) -> list[tuple]:
+    """Text → [("text", str) | ("code", lang, code)], so ``` fences become code blocks."""
+    out: list[tuple] = []
+    pos = 0
+    for m in _FENCE.finditer(text):
+        if m.start() > pos and text[pos:m.start()].strip():
+            out.append(("text", text[pos:m.start()].strip("\n")))
+        out.append(("code", (m.group(1) or "").strip(), m.group(2).rstrip("\n")))
+        pos = m.end()
+    if pos < len(text) and text[pos:].strip():
+        out.append(("text", text[pos:].strip("\n")))
+    return out
+
+
+def _md(seg: str) -> str:
+    """Prepare a text segment for Qt's Markdown renderer: raw '<' is escaped (no HTML injection) and single line breaks stay."""
+    seg = seg.replace("<", "&lt;")
+    return re.sub(r"(?<!\n)\n(?!\n)", "  \n", seg)
+
+
+def _find_files(text: str, limit: int = 3) -> list[str]:
+    """Existing local files mentioned in a message (not executables), for a preview card under the bubble."""
+    found: list[str] = []
+    for m in _PATH_RE.finditer(text or ""):
+        cand = m.group(0).rstrip(".,;:!?)]}»”’")
+        if len(cand) > 300:
+            continue
+        ext = os.path.splitext(cand)[1].lstrip(".").lower()
+        if not ext or ext in _RISKY_EXT:
+            continue
+        try:
+            path = os.path.expanduser(cand)
+            if os.path.isfile(path) and path not in found:
+                found.append(path)
+        except Exception:
+            continue
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _human_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} B"
+
+
+class _ClickLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+
+def _open_file(path: str) -> None:
+    try:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+    except Exception:
+        pass
+
+
+def _file_preview(path: str) -> QWidget | None:
+    """A clickable thumbnail for an image, or a small file card for anything else."""
+    try:
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        ext = os.path.splitext(name)[1].lstrip(".").lower()
+        if ext in _IMG_EXT and size <= 25 * 1024 * 1024:
+            pm = QPixmap(path)
+            if not pm.isNull():
+                pm = pm.scaled(300, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                lb = _ClickLabel()
+                lb.setPixmap(pm)
+                lb.setToolTip(f"{name} · click to open")
+                lb.setStyleSheet(f"border: 1px solid {rgba('#ffffff', .14)}; border-radius: 10px; padding: 2px; background: transparent;")
+                lb.clicked.connect(lambda p=path: _open_file(p))
+                return lb
+        card = _ClickLabel(f"📄  {name}\n      {_human_size(size)}")
+        card.setFont(font(10))
+        card.setToolTip(f"{path}\nclick to open")
+        card.setStyleSheet(
+            f"background: {rgba('#000000', .25)}; border: 1px solid {rgba('#ffffff', .12)}; border-radius: 10px;"
+            f"padding: 8px 12px; color: {C.TEXT};")
+        card.clicked.connect(lambda p=path: _open_file(p))
+        return card
+    except Exception:
+        return None
+
+
+class CodeBlock(QFrame):
+    """A fenced code block: language tag, monospace text and a Copy button that confirms with 'Copied ✓'."""
+
+    def __init__(self, lang: str, code: str, copy_cb):
+        super().__init__()
+        self._code = code
+        self._copy_cb = copy_cb
+        self.setObjectName("codeblock")
+        self.setStyleSheet(
+            f"QFrame#codeblock {{ background: {rgba('#000000', .38)}; border: 1px solid {rgba('#ffffff', .10)}; border-radius: 10px; }}")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 6, 12, 10)
+        v.setSpacing(4)
+        top = QHBoxLayout()
+        tag = QLabel((lang or "code").upper())
+        tag.setFont(font(8, QFont.Weight.DemiBold))
+        tag.setStyleSheet(f"color: {C.TEXT_DIM}; letter-spacing: 2px; background: transparent;")
+        top.addWidget(tag)
+        top.addStretch()
+        self._btn = QPushButton("Copy")
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.PRI}; border: none; font-size: 11px; padding: 2px 6px; }}"
+            f"QPushButton:hover {{ color: {C.TEXT}; }}")
+        self._btn.clicked.connect(self._copy)
+        top.addWidget(self._btn)
+        v.addLayout(top)
+        body = QLabel(code)
+        body.setTextFormat(Qt.TextFormat.PlainText)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        f = QFont("Consolas", 10)
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        body.setFont(f)
+        body.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        v.addWidget(body)
+
+    def _copy(self):
+        self._copy_cb(self._code)
+        self._btn.setText("Copied ✓")
+        QTimer.singleShot(1500, self._reset)
+
+    def _reset(self):
+        try:
+            self._btn.setText("Copy")
+        except RuntimeError:                                       # the row was deleted meanwhile
+            pass
+
+
+class _TypingDots(QWidget):
+    """Three bouncing dots, shown while Jarvis is thinking."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(48, 20)
+        self._ph = 0.0
+        self._tm = QTimer(self)
+        self._tm.timeout.connect(self._tick)
+        self._tm.start(70)
+
+    def _tick(self):
+        if self.isVisible():
+            self._ph += 0.30
+            self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(3):
+            k = 0.5 + 0.5 * math.sin(self._ph - i * 0.9)
+            p.setBrush(qcol(C.PRI, int(90 + 150 * k)))
+            r = 3.0 + 1.7 * k
+            p.drawEllipse(QPointF(10 + i * 14, 10 - 3.0 * k), r, r)
+
+
+class _ReactionBar(QWidget):
+    """👍 👎 ❤️ and Copy under an assistant message: they appear while the mouse is over the row, a chosen reaction stays."""
+
+    def __init__(self, on_react, on_copy):
+        super().__init__()
+        self.setFixedHeight(26)
+        self._on_react = on_react
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 0, 0, 0)
+        lay.setSpacing(4)
+        self._btns: list[QPushButton] = []
+        for emoji in ("👍", "👎", "❤️"):
+            b = QPushButton(emoji)
+            b.setCheckable(True)
+            b.setFixedSize(32, 24)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton {{ background: {rgba('#ffffff', .05)}; border: 1px solid {rgba('#ffffff', .08)}; border-radius: 12px; font-size: 12px; }}"
+                f"QPushButton:hover {{ background: {rgba('#ffffff', .12)}; }}"
+                f"QPushButton:checked {{ background: {rgba(C.PRI, .24)}; border: 1px solid {rgba(C.PRI, .55)}; }}")
+            b.toggled.connect(lambda on, e=emoji, bt=b: self._react(e, bt, on))
+            lay.addWidget(b)
+            self._btns.append(b)
+        self._copy = QPushButton("Copy")
+        self._copy.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy.setFixedHeight(24)
+        self._copy.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.TEXT_DIM}; border: none; font-size: 11px; padding: 0 8px; }}"
+            f"QPushButton:hover {{ color: {C.PRI}; }}")
+
+        def do_copy():
+            on_copy()
+            self._copy.setText("Copied ✓")
+            QTimer.singleShot(1500, self._reset_copy)
+        self._copy.clicked.connect(do_copy)
+        lay.addWidget(self._copy)
+        lay.addStretch()
+        self.set_hover(False)
+
+    def _reset_copy(self):
+        try:
+            self._copy.setText("Copy")
+        except RuntimeError:
+            pass
+
+    def _react(self, emoji: str, btn: QPushButton, on: bool):
+        if on:                                                     # one reaction per message
+            for o in self._btns:
+                if o is not btn and o.isChecked():
+                    o.blockSignals(True)
+                    o.setChecked(False)
+                    o.blockSignals(False)
+        self._on_react(emoji, on)
+
+    def set_hover(self, hover: bool):
+        for b in self._btns:
+            b.setVisible(hover or b.isChecked())
+        self._copy.setVisible(hover)
+
+
+class _MsgRow(QWidget):
+    """One chat row; shows its reaction bar (if any) while the mouse is over it."""
+
+    def __init__(self):
+        super().__init__()
+        self.bar: _ReactionBar | None = None
+
+    def enterEvent(self, e):
+        if self.bar is not None:
+            self.bar.set_hover(True)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        if self.bar is not None:
+            self.bar.set_hover(False)
+        super().leaveEvent(e)
+
+
 class ChatView(QScrollArea):
+    copied = pyqtSignal(str)                  # emitted just before something is put on the clipboard
+    reacted = pyqtSignal(str, str, bool)      # emoji, message text, on / off
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -402,6 +671,7 @@ class ChatView(QScrollArea):
         self._lay.addStretch()
         self.setWidget(self._body)
         self._count = 0
+        self._typing: QWidget | None = None
         self.verticalScrollBar().rangeChanged.connect(self._stick)
 
     def _bw(self) -> int:
@@ -410,58 +680,134 @@ class ChatView(QScrollArea):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         w = self._bw()
-        for lb in self._body.findChildren(QLabel):
-            if lb.property("bub"):
-                lb.setMaximumWidth(w)
+        for fr in self._body.findChildren(QFrame):
+            if fr.property("bub"):
+                fr.setMaximumWidth(w)
 
     def _stick(self, _lo, hi):
         self.verticalScrollBar().setValue(hi)
 
     def clear(self):
+        self._typing = None
         while self._lay.count() > 1:
             it = self._lay.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
         self._count = 0
 
+    # ── clipboard / reactions ────────────────────────────────────────────────────────
+    def copy_text(self, text: str):
+        self.copied.emit(text)                                     # the window learns the text first, so its clipboard hint skips it
+        QApplication.clipboard().setText(text)
+
+    # ── typing indicator ─────────────────────────────────────────────────────────────
+    def set_typing(self, on: bool):
+        if on and self._typing is None:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            bub = QFrame()
+            bub.setObjectName("chatbub")
+            bub.setStyleSheet(
+                f"QFrame#chatbub {{ background: {rgba('#ffffff', .07)}; border: 1px solid {rgba('#ffffff', .10)}; border-radius: 18px; }}")
+            bl = QHBoxLayout(bub)
+            bl.setContentsMargins(16, 8, 16, 8)
+            bl.addWidget(_TypingDots())
+            h.addWidget(bub)
+            h.addStretch()
+            self._lay.insertWidget(self._lay.count() - 1, row)
+            self._typing = row
+            fade_in(row, 200)
+        elif not on and self._typing is not None:
+            row, self._typing = self._typing, None
+            self._lay.removeWidget(row)
+            row.deleteLater()
+
+    # ── messages ─────────────────────────────────────────────────────────────────────
+    def _bubble(self, kind: str, who: str, text: str) -> QFrame:
+        bub = QFrame()
+        bub.setObjectName("chatbub")
+        bub.setProperty("bub", True)
+        bub.setMaximumWidth(self._bw())
+        if kind == "user":
+            bub.setStyleSheet(
+                f"QFrame#chatbub {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {rgba(C.PRI, .30)}, stop:1 {rgba(C.ACC, .30)});"
+                f"border: 1px solid {rgba(C.PRI, .45)}; border-radius: 18px; }}")
+        else:
+            bub.setStyleSheet(
+                f"QFrame#chatbub {{ background: {rgba('#ffffff', .07)}; border: 1px solid {rgba('#ffffff', .10)}; border-radius: 18px; }}")
+        v = QVBoxLayout(bub)
+        v.setContentsMargins(17, 12, 17, 12)
+        v.setSpacing(8)
+        if who and kind != "user":
+            wl = QLabel(who)
+            wl.setStyleSheet(f"color: {C.PRI}; font-weight: 600; background: transparent;")
+            wl.setFont(font(11, QFont.Weight.DemiBold))
+            v.addWidget(wl)
+        blocks = _split_blocks(text) or [("text", text)]
+        for blk in blocks:
+            if blk[0] == "code":
+                v.addWidget(CodeBlock(blk[1], blk[2], self.copy_text))
+                continue
+            lb = QLabel()
+            lb.setWordWrap(True)
+            lb.setFont(font(12))
+            lb.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+            if kind == "user":
+                lb.setTextFormat(Qt.TextFormat.PlainText)
+                lb.setText(blk[1])
+                lb.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            else:
+                lb.setTextFormat(Qt.TextFormat.MarkdownText)
+                lb.setText(_md(blk[1]))
+                lb.setOpenExternalLinks(True)
+                lb.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+            v.addWidget(lb)
+        for path in _find_files(text):
+            pv = _file_preview(path)
+            if pv is not None:
+                v.addWidget(pv, 0, Qt.AlignmentFlag.AlignLeft)
+        return bub
+
     def add(self, kind: str, who: str, text: str):
+        if kind == "ai":
+            self.set_typing(False)                                 # the answer has arrived
         if self._count > 150:
             it = self._lay.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
             self._count -= 1
-        row = QWidget()
-        h = QHBoxLayout(row)
+        row = _MsgRow()
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        h = QHBoxLayout()
         h.setContentsMargins(0, 0, 0, 0)
-        bub = QLabel(text)
-        bub.setWordWrap(True)
-        bub.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        bub.setFont(font(12))
-        bub.setProperty("bub", True)
-        bub.setMaximumWidth(self._bw())
-        if kind == "user":
-            bub.setStyleSheet(
-                f"background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {rgba(C.PRI, .30)}, stop:1 {rgba(C.ACC, .30)});"
-                f"border: 1px solid {rgba(C.PRI, .45)}; border-radius: 18px; padding: 12px 17px; color: {C.TEXT};")
-            h.addStretch()
-            h.addWidget(bub)
-        elif kind in ("sys", "err"):
+        if kind in ("sys", "err"):
+            bub = QLabel(text)
+            bub.setWordWrap(True)
+            bub.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             col = C.RED if kind == "err" else C.TEXT_DIM
             bub.setFont(font(9))
             bub.setStyleSheet(f"color: {col}; padding: 2px 6px; background: transparent;")
+            bub.setProperty("bub", True)
             h.addWidget(bub)
             h.addStretch()
+        elif kind == "user":
+            h.addStretch()
+            h.addWidget(self._bubble(kind, who, text))
         else:
-            bub.setStyleSheet(
-                f"background: {rgba('#ffffff', .07)}; border: 1px solid {rgba('#ffffff', .10)};"
-                f"border-radius: 18px; padding: 12px 17px; color: {C.TEXT};")
-            if who:
-                bub.setText(f"<span style='color:{C.PRI};font-weight:600'>{who}</span><br>{text}")
-            h.addWidget(bub)
+            h.addWidget(self._bubble(kind, who, text))
             h.addStretch()
-        self._lay.insertWidget(self._lay.count() - 1, row)
+        outer.addLayout(h)
+        if kind == "ai":
+            bar = _ReactionBar(lambda emoji, on, t=text: self.reacted.emit(emoji, t, on), lambda t=text: self.copy_text(t))
+            row.bar = bar
+            outer.addWidget(bar, 0, Qt.AlignmentFlag.AlignLeft)
+        self._lay.insertWidget(self._lay.count() - 1 - (1 if self._typing is not None else 0), row)
         self._count += 1
         fade_in(row, 260)
+
 
 
 class HueSlider(QWidget):

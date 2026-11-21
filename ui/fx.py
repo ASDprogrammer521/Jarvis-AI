@@ -614,6 +614,10 @@ class Stage3D(QWidget):
         self._last = time.time()
         self._live = 0.0
         self._amp = 0.0
+        self._vo = 0.0                         # smoothed mouth opening of the current viseme (0..1)
+        self._vw = 0.0                         # smoothed mouth width (-1 round .. +1 wide)
+        self._ring_a = 0.0                     # fade of the voice waveform ring
+        self.voice_ring = bool(read_cfg().get("voice_ring", True))
         self._visemes = None
         self._vis_i = None
         self._ripples: list[float] = []
@@ -749,6 +753,14 @@ class Stage3D(QWidget):
                 self._vis_i = None
         self._live *= 0.86
         self._amp += (self._live - self._amp) * 0.4
+        if v_open is not None:                                     # the mouth shape that is being spoken right now
+            self._vo += (max(0.0, min(1.0, v_open)) - self._vo) * 0.45
+            self._vw += (max(-1.0, min(1.0, v_wide or 0.0)) - self._vw) * 0.45
+        else:
+            self._vo *= 0.85
+            self._vw *= 0.85
+        want_ring = 1.0 if (self.speaking or self._amp > 0.03) and not self.muted and self.voice_ring else 0.0
+        self._ring_a += (want_ring - self._ring_a) * min(1.0, dt * 6)
         self._t += dt * self.speed
         mt, at = self._targets()
         self._cm += (np.array(mt.getRgb()[:3], dtype=np.float64) - self._cm) * min(1.0, dt * 6)
@@ -768,7 +780,7 @@ class Stage3D(QWidget):
             self._next_ripple = now + 0.75
         self._ripples = [r for r in self._ripples if self._t - r < 2.2]
 
-        active = (self.speaking or self._amp > 0.02 or self._drag is not None
+        active = (self.speaking or self._amp > 0.02 or self._ring_a > 0.02 or self._drag is not None
                   or bool(self._ripples) or self._visemes is not None)
         try:
             focused = self.window().isActiveWindow()
@@ -1098,6 +1110,37 @@ class Stage3D(QWidget):
         except Exception as e:
             print(f"[GPU holo] self-check skipped: {e}")
 
+    def _voice_ring(self, p, cx: float, cy: float, R: float) -> None:
+        """Circular waveform around the model: it flexes with the loudness of Jarvis' voice, stretches taller with an open
+        mouth shape (a, o) and wider with a spread one (e, i) — the viseme stream from core/viseme.py drives it."""
+        a = self._ring_a
+        if a < 0.02:
+            return
+        amp, t = self._amp, self._t
+        n = 64 if self.lite else 120
+        main, acc = self._col("m"), self._col("a")
+        amp_px = R * (0.015 + 0.17 * amp)
+        rings = ((1.30, 1.0, main, 1.9, 210),) if self.lite else ((1.30, 1.0, main, 1.9, 210), (1.21, 0.55, acc, 1.2, 120))
+        p.save()
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for k, (rad, gain, col, wid, alpha) in enumerate(rings):
+            rb = R * rad
+            rx = rb * (1.0 + 0.05 * self._vw)
+            ry = rb * (1.0 + 0.06 * self._vo)
+            ph = t * (4.2 if k == 0 else -3.1)
+            poly = QPolygonF()
+            for i in range(n + 1):
+                th = 2.0 * math.pi * (i % n) / n
+                w = 0.5 * math.sin(th * 5 + ph) + 0.3 * math.sin(th * 9 - ph * 1.45) + 0.2 * math.sin(th * 3 + ph * 0.55)
+                off = amp_px * gain * w
+                poly.append(QPointF(cx + (rx + off) * math.cos(th), cy + (ry + off) * math.sin(th)))
+            if not self.lite:                                      # soft glow under the line
+                p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), int(45 * a)), wid * 3.2))
+                p.drawPolyline(poly)
+            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), int(alpha * a)), wid))
+            p.drawPolyline(poly)
+        p.restore()
+
     def _draw_model(self, p, name, cx, cy, R, yaw, pitch, amp):
         m = self._models.get(name)
         if m is None:
@@ -1114,7 +1157,7 @@ class Stage3D(QWidget):
         band_h = H * (0.78 if self.show_status else 0.96)
         cx = W / 2 + self._look[0] * W * 0.05
         cy = band_h * 0.50 + self._look[1] * H * 0.04
-        R = min(W * 0.30, band_h * 0.29) * (1.0 + amp * 0.06)
+        R = min(W * 0.30, band_h * 0.29) * (1.0 + amp * 0.06 + self._vo * 0.025)
         self._geom = (cx, cy, R)
         main, acc = self._col("m"), self._col("a")
 
@@ -1155,6 +1198,7 @@ class Stage3D(QWidget):
         yaw, pitch = self._yaw + self._look[0] * 2.0, self._pitch + self._look[1]
         if self._meta("hud", "1") != "0":
             self._hud_rings(p, cx, cy, R * 1.62)
+        self._voice_ring(p, cx, cy, R)
         if self._meta("rim", "0") != "0" and not self.lite:
             rim = QRadialGradient(cx, cy, R * 1.22)
             rim.setColorAt(0.78, QColor(main.red(), main.green(), main.blue(), 0))

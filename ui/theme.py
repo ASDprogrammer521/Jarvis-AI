@@ -128,9 +128,44 @@ THEMES: dict[str, dict] = {
                            "BORDER": "#2b2b2b", "BORDER_B": "#444444",
                            "TEXT": "#f4f4f4", "TEXT_MED": "#b5b5b5", "TEXT_DIM": "#7a7a7a"}},
     "emerald":  {"label": "Emerald",  "accent": "#2ee6a6", "over": {}},
+    "sunset":   {"label": "Sunset", "accent": "#ff7a45",
+                 "over": {"ACC": "#b36bff", "ACC2": "#ff4fa3", "PRI": "#ff8a4c", "PRI_DIM": "#c4562a", "PRI_GHO": "#3a1a22",
+                           "BG": "#0b0612", "BG2": "#140a1f", "PANEL": "#1e1030", "PANEL2": "#2a1642",
+                           "BORDER": "#4a2a6b", "BORDER_B": "#7a46a8"}},
+    "arc":      {"label": "Arc Reactor", "accent": "#bfefff",
+                 "over": {"ACC": "#6ecbff", "ACC2": "#ffffff", "PRI": "#d6f4ff", "PRI_DIM": "#7fb7cf", "PRI_GHO": "#10303d",
+                           "BG": "#04090f", "BG2": "#09131d", "PANEL": "#0f2230", "PANEL2": "#15303f",
+                           "BORDER": "#26495e", "BORDER_B": "#3f7894"}},
+    "matrix":   {"label": "Matrix", "accent": "#2cff6a",
+                 "over": {"ACC": "#9dff8a", "ACC2": "#00d4a0", "PRI": "#3dff7a", "PRI_DIM": "#1fa84d", "PRI_GHO": "#08301a",
+                           "BG": "#010503", "BG2": "#04100a", "PANEL": "#071a0f", "PANEL2": "#0b2415",
+                           "BORDER": "#124a28", "BORDER_B": "#1f8048",
+                           "TEXT": "#d9ffe6", "TEXT_MED": "#8fd9a8", "TEXT_DIM": "#4f8a63"}},
+    "sakura":   {"label": "Sakura", "accent": "#ff9ccf",
+                 "over": {"ACC": "#d9a6ff", "ACC2": "#ffd1e6", "PRI": "#ffa8d2", "PRI_DIM": "#c46e9c", "PRI_GHO": "#3a1830",
+                           "BG": "#0d0609", "BG2": "#170a12", "PANEL": "#241220", "PANEL2": "#311a2c",
+                           "BORDER": "#58304a", "BORDER_B": "#8c4f77"}},
+    # "Daylight" is a soft, lighter slate theme (not pure white: the glass cards and the 3D stage are built for dark surfaces).
+    "daylight": {"label": "Daylight", "accent": "#2f7bff",
+                 "over": {"ACC": "#7a5cff", "ACC2": "#ff6aa8", "PRI": "#7fb2ff", "PRI_DIM": "#4a86e0", "PRI_GHO": "#243a63",
+                           "BG": "#2a3550", "BG2": "#323f5e", "PANEL": "#3b4a6e", "PANEL2": "#455682",
+                           "BORDER": "#5a6c9a", "BORDER_B": "#7d92c4",
+                           "TEXT": "#f6f8ff", "TEXT_MED": "#d0d9f2", "TEXT_DIM": "#a2b0d6"}},
 }
-THEME_ORDER = ("jarvis", "ironman", "neon", "minimal", "emerald")
+THEME_ORDER = ("jarvis", "ironman", "neon", "minimal", "emerald", "sunset", "arc", "matrix", "sakura", "daylight")
 _THEME = {"key": "jarvis"}
+
+# Automatic day / night: with "ui_theme_auto": true in the config, Jarvis uses DAY_THEME from DAY_START to NIGHT_START
+# (local time) and the theme you picked (or Jarvis) the rest of the day.
+DAY_THEME = "daylight"
+DAY_START, NIGHT_START = 7, 19
+
+
+def auto_theme_key(base: str, hour: int | None = None) -> str:
+    """The theme to show right now: DAY_THEME during the day, `base` at night."""
+    import datetime
+    h = datetime.datetime.now().hour if hour is None else hour
+    return DAY_THEME if DAY_START <= h < NIGHT_START else (base if base in THEMES else "jarvis")
 
 
 def apply_theme(key: str) -> bool:

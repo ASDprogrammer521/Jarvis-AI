@@ -60,11 +60,13 @@ def _safe(timer, fn) -> None:
 
 
 
-def _theme_row(win) -> QHBoxLayout:
+def _theme_row(win):
     """One card per ready-made theme: a small preview (background + accent dots) and its name; the current one is outlined."""
     from ui.theme import THEMES, THEME_ORDER, T, current_theme
-    row = QHBoxLayout()
-    row.setSpacing(T.S3)
+    from PyQt6.QtWidgets import QGridLayout
+    row = QGridLayout()
+    row.setHorizontalSpacing(T.S3)
+    row.setVerticalSpacing(T.S3)
     cur = current_theme() if not (read_cfg().get("ui_theme") == "" and read_cfg().get("ui_color")) else ""
     btns = []
 
@@ -78,7 +80,7 @@ def _theme_row(win) -> QHBoxLayout:
                 f"border: 2px solid {C.PRI if on else rgba('#ffffff', .10)}; padding: 0; font-weight: 600; font-size: 11px; }}"
                 f"QPushButton:hover {{ border-color: {C.PRI_DIM if not on else C.PRI}; }}")
 
-    for key in THEME_ORDER:
+    for i, key in enumerate(THEME_ORDER):
         th = THEMES[key]
         b = QPushButton(th["label"])
         b.setFixedSize(92, 62)
@@ -86,8 +88,8 @@ def _theme_row(win) -> QHBoxLayout:
         b.setToolTip(f"{th['label']} theme")
         b.clicked.connect(lambda _=False, k=key: (win.set_theme(k), mark(k)))
         btns.append((key, b))
-        row.addWidget(b)
-    row.addStretch()
+        row.addWidget(b, i // 5, i % 5)                         # five per row, so ten themes fit any window width
+    row.setColumnStretch(5, 1)
     mark(cur)
     return row
 
@@ -332,6 +334,12 @@ class SettingsPanel(GlassCard):
         lay.addWidget(_hdr("Appearance", "Colours, 3D model and visual effects — applied instantly"))
         lay.addWidget(section_label("Theme"))
         lay.addLayout(_theme_row(w))
+        au = Toggle(bool(read_cfg().get("ui_theme_auto", False)))
+        au.toggled.connect(w.set_theme_auto)
+        lay.addWidget(setting_row("Automatic day / night", "Daylight theme from 07:00 to 19:00, your chosen theme in the evening and at night", au))
+        bi = Toggle(bool(read_cfg().get("boot_intro", True)))
+        bi.toggled.connect(w.set_boot_intro)
+        lay.addWidget(setting_row("Boot intro", "A short \"Initializing core… Online\" sequence when Jarvis starts", bi))
         lay.addWidget(section_label("Accent colour"))
         hue = HueSlider(C.PRI)
         hex_in = QLineEdit(C.PRI)
@@ -376,6 +384,10 @@ class SettingsPanel(GlassCard):
         gh = Toggle(bool(read_cfg().get("gpu_holo", True)))
         gh.toggled.connect(w.set_gpu_holo)
         lay.addWidget(setting_row("GPU hologram renderer", "Draws the Holo model with shaders on the graphics card (very low CPU). Switches itself off if unsupported.", gh))
+        lay.addWidget(divider())
+        vr = Toggle(bool(read_cfg().get("voice_ring", True)))
+        vr.toggled.connect(w.set_voice_ring)
+        lay.addWidget(setting_row("Voice waveform ring", "A ring around the 3D model that moves with Jarvis' voice and mouth shapes", vr))
         lay.addWidget(divider())
         sp = Toggle(bool(read_cfg().get("show_perf", False)))
         sp.toggled.connect(w.set_perf)

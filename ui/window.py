@@ -23,7 +23,7 @@ import ui.theme as ui_theme
 from ui.fx import GL_ENABLED, Backdrop, GlassCard, GlowButton, ModalLayer, Stage3D, Toggle, fade_in, slide_to
 from ui.metrics import _metrics
 from ui.panels import APP_VERSION, ConfirmPanel, RemotePanel, SettingsPanel, SetupPanel
-from ui.theme import C, DEFAULT_ACCENT, T, apply_accent, apply_theme, build_qss, current_theme, patch_cfg, qcol, read_cfg, rgba
+from ui.theme import C, DAY_THEME, DEFAULT_ACCENT, THEMES, T, apply_accent, apply_theme, auto_theme_key, build_qss, current_theme, patch_cfg, qcol, read_cfg, rgba
 from ui.video_extras import PlayerButton, PlayButton, PlayerSettings, VideosOverlay
 from ui.toasts import ToastCenter
 from ui.pages import DashboardPage, InputBar, LogoMark, NavItem, PhonePage, Sidebar
@@ -1284,10 +1284,19 @@ class MainWindow(QMainWindow):
         self.user_name = cfg.get("user_name") or ""
         col = (cfg.get("ui_color") or "").strip()
         theme = (cfg.get("ui_theme") or "").strip().lower()
-        if theme and apply_theme(theme):
-            pass                                              # a ready-made theme (Settings → Appearance)
+        self._auto_period = None                              # "day" / "night" last applied by the automatic theme
+        if cfg.get("ui_theme_auto") and auto_theme_key(theme or "jarvis") == DAY_THEME:
+            apply_theme(DAY_THEME)                            # automatic day / night: it is daytime
+            self._auto_period = "day"
+        elif theme and apply_theme(theme):
+            if cfg.get("ui_theme_auto"):
+                self._auto_period = "night"                   # a ready-made theme (Settings → Appearance)
         elif col and col.lower() != DEFAULT_ACCENT:
             apply_accent(col)
+            if cfg.get("ui_theme_auto"):
+                self._auto_period = "night"
+        elif cfg.get("ui_theme_auto"):
+            self._auto_period = "night"
         self.setStyleSheet(build_qss())
         self.setWindowTitle(self.assistant_name.upper())
         self.setMinimumSize(960, 640)
@@ -1405,7 +1414,13 @@ class MainWindow(QMainWindow):
         self._lock_timer = QTimer(self)
         self._lock_timer.timeout.connect(self._lock_tick)
         self._lock_timer.start(1000)
-        QTimer.singleShot(450, self._lock_on_start)
+        self._boot_screen = None
+        boot_on = bool(read_cfg().get("boot_intro", True))
+        if boot_on:
+            from ui.boot_screen import BootScreen
+            QTimer.singleShot(60, self._show_boot_intro)
+        # the lock screen waits for the boot intro, so the intro plays first and the lock appears right after it
+        QTimer.singleShot(450 + (BootScreen.DURATION_MS if boot_on else 0), self._lock_on_start)
         self.gesture_status = "off"
         self.camera = None
         QTimer.singleShot(2500, self._camera_autostart)
@@ -1424,10 +1439,32 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().dataChanged.connect(self._on_clip)
         except Exception:
             pass
+        self._theme_timer = QTimer(self)
+        self._theme_timer.timeout.connect(self._auto_theme_tick)
+        self._theme_timer.start(60_000)
         QTimer.singleShot(250, self._boot)
         QTimer.singleShot(2500, self._check_gpu)
         QTimer.singleShot(9000, self._auto_update_check)
         QTimer.singleShot(3500, self._start_island)
+
+    def _show_boot_intro(self):
+        """Cinematic start-up sequence over the window; never lets a problem here get in the way of starting."""
+        try:
+            from ui.boot_screen import BootScreen
+            self._boot_screen = BootScreen(self, self.assistant_name)
+            self._boot_screen.finished.connect(lambda: setattr(self, "_boot_screen", None))
+            self._boot_screen.start()
+        except Exception as e:
+            self._boot_screen = None
+            self.write_log(f"ERR: boot intro — {e}")
+
+    def set_voice_ring(self, on: bool):
+        self.stage.voice_ring = bool(on)
+        patch_cfg(voice_ring=bool(on))
+
+    def set_boot_intro(self, on: bool):
+        patch_cfg(boot_intro=bool(on))
+        self._toast("Boot intro: on" if on else "Boot intro: off")
 
     def _boot(self):
         try:
@@ -1582,6 +1619,8 @@ class MainWindow(QMainWindow):
         cv.addLayout(ch)
         self.chat = ChatView()
         clr.clicked.connect(self.chat.clear)
+        self.chat.copied.connect(lambda t: setattr(self, "_last_clip", t))            # our own Copy must not trigger the clipboard hint
+        self.chat.reacted.connect(lambda e, _t, on: self._toast(f"Reaction {e} saved") if on else None)
         cv.addWidget(self.chat, 1)
         self.chat_bar = InputBar()
         cv.addWidget(self.chat_bar)
@@ -2012,17 +2051,60 @@ class MainWindow(QMainWindow):
         if save:
             patch_cfg(ui_color=C.PRI, ui_theme="")            # a custom accent replaces the ready-made theme
 
-    def set_theme(self, key: str):
-        """Switch to a ready-made theme (Jarvis, Iron Man, Neon, Minimal, Emerald) — instantly, no restart."""
-        if not apply_theme(key):
-            return
+    def _repaint_theme(self):
         self.setStyleSheet(build_qss())
         for w in self.findChildren(QWidget):
             w.update()
         self.title.update()
         self.backdrop._dirty = True
+
+    def set_theme(self, key: str):
+        """Switch to a ready-made theme (Jarvis, Iron Man, Neon, Minimal, Emerald, Sunset, Arc, Matrix, Sakura, Daylight) — instantly."""
+        if not apply_theme(key):
+            return
+        self._repaint_theme()
         patch_cfg(ui_theme=current_theme(), ui_color=C.PRI)
-        self._toast(f"Theme: {key.replace('ironman', 'Iron Man').title()}")
+        self._toast(f"Theme: {THEMES.get(current_theme(), {}).get('label', key.title())}")
+
+    # ── automatic day / night ──────────────────────────────────────────────────────────
+    def set_theme_auto(self, on: bool):
+        patch_cfg(ui_theme_auto=bool(on))
+        if on:
+            self._auto_period = None
+            self._auto_theme_tick()
+            self._toast("Automatic day / night: on")
+        else:
+            self._auto_period = None
+            self._restore_night_look()
+            self._toast("Automatic day / night: off")
+
+    def _restore_night_look(self):
+        """Back to the look the user chose: their ready-made theme, else their custom accent, else the default."""
+        cfg = read_cfg()
+        theme = (cfg.get("ui_theme") or "").strip().lower()
+        col = (cfg.get("ui_color") or "").strip()
+        if not (theme and apply_theme(theme)):
+            apply_theme("jarvis")
+            if col and col.lower() != DEFAULT_ACCENT:
+                apply_accent(col)
+        self._repaint_theme()
+
+    def _auto_theme_tick(self):
+        """Once a minute: switch only when day turns into night or back, so a theme picked by hand is not overridden at once."""
+        cfg = read_cfg()
+        if not cfg.get("ui_theme_auto"):
+            return
+        theme = (cfg.get("ui_theme") or "").strip().lower()
+        period = "day" if auto_theme_key(theme or "jarvis") == DAY_THEME else "night"
+        if period == self._auto_period:
+            return
+        first = self._auto_period is None
+        self._auto_period = period
+        if period == "day":
+            if apply_theme(DAY_THEME):
+                self._repaint_theme()
+        elif not first or current_theme() == DAY_THEME:
+            self._restore_night_look()
 
     def set_model(self, name: str):
         self.stage.set_model(name)
@@ -2841,6 +2923,8 @@ class MainWindow(QMainWindow):
             self._state = s
         self.stage.state = s
         self.stage.speaking = s == "SPEAKING"
+        if getattr(self, "chat", None) is not None:
+            self.chat.set_typing(s in ("THINKING", "PROCESSING") and not self._muted)        # the "typing…" dots in the conversation
         self.mini.state = "MUTED" if self._muted else s
         label = "MUTED" if self._muted else s
         col = getattr(C, self._STATE_COL.get(label, "PRI"))

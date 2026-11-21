@@ -113,7 +113,9 @@ def probe(timeout: float = PROBE_TIMEOUT) -> float | None:
     try:
         with socket.create_connection((LIVE_HOST, 443), timeout=timeout) as s:
             s.settimeout(timeout)
-            with ssl.create_default_context().wrap_socket(s, server_hostname=LIVE_HOST):
+            ctx = ssl.create_default_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2          # never negotiate TLS 1.0 / 1.1 (CodeQL: insecure SSL/TLS version)
+            with ctx.wrap_socket(s, server_hostname=LIVE_HOST):
                 pass
         return (time.perf_counter() - t0) * 1000.0
     except Exception:
