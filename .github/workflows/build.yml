@@ -49,19 +49,28 @@ jobs:
             pyinstaller --onefile --windowed --name Jarvis main.py
           }
 
-      - name: Create GitHub Release and Upload EXE
+      - name: Zip build folder
+        shell: pwsh
+        run: |
+          if (Test-Path dist/Jarvis -PathType Container) {
+            Compress-Archive -Path dist/Jarvis -DestinationPath dist/Jarvis-Windows.zip -Force
+          }
+
+      - name: Create GitHub Release and Upload
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.get_version.outputs.VERSION }}-windows
           name: 💻 Windows v${{ steps.get_version.outputs.VERSION }}
+          fail_on_unmatched_files: true
           body: |
             ## ⚡ Jarvis AI - Windows Release
             > **Version:** `${{ steps.get_version.outputs.VERSION }}`
             > **Platform:** Windows Desktop (x64)
-            
+
             ### ✨ What's New & Cool:
             * 🚀 Compiled seamlessly via PyInstaller pipeline.
             * 💎 Standalone executable ready for high-performance operations.
-            
-            *Download the `.exe` file below and run it directly.*
-          files: dist/*.exe
+
+            *Download `Jarvis-Windows.zip`, extract it and run `Jarvis.exe`.*
+          files: |
+            dist/Jarvis-Windows.zip
